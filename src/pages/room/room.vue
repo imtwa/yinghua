@@ -76,55 +76,56 @@
                 @error="onCallError" />
 
             <!--
-                展开态的悬浮按钮组，压在视频下缘。
+                展开态操作条，压在视频下缘：麦克风 / 摄像头 / 收起。
 
-                只保留**麦克风 + 摄像头**两个开关（参照微信）：
-                挂断在这个应用里等同于「退出房间」，主操作已由页面的
-                通话控制条承担，放进小窗里既重复又容易误触 ——
-                用户本想关摄像头却点到挂断，房间就散了。
+                收起是**独立按钮**，不再靠「点画面」——
+                早先点任意处就收起，拖动或误触都会让窗口突然弹开或缩起，
+                很反直觉。现在只有按钮能改变形态（双击画面改为调缩放）。
 
-                收起改由「点击画面」触发（也是微信的做法），不占按钮位。
-
-                图标用 CSS 绘制而非 emoji：emoji 在不同 Android WebView 上
-                渲染差异大（有的彩色、有的单色、个别机型显示豆腐块），
-                且彩色图形与这里的暗色小按钮不协调。
-                CSS 图形跨设备完全一致，颜色还能随状态继承。
+                图标用内联 SVG（data URI + mask）：
+                CSS 手绘的几何图形在小尺寸下形状不清晰，
+                SVG 是矢量、跨设备渲染一致，颜色还能随当前状态继承。
             -->
             <view class="room__pip-acts" @click.stop>
                 <view
                     class="room__pact tap"
                     :class="{ 'room__pact--off': !audioOn }"
                     @click.stop="toggleAudio">
-                    <view class="room__ico room__ico--mic" :class="{ 'is-off': !audioOn }" />
+                    <view class="room__ico" :class="audioOn ? 'room__ico--mic' : 'room__ico--mic-off'" />
                 </view>
                 <view
                     class="room__pact tap"
                     :class="{ 'room__pact--off': !videoOn }"
                     @click.stop="toggleVideo">
-                    <view class="room__ico room__ico--cam" :class="{ 'is-off': !videoOn }" />
+                    <view class="room__ico" :class="videoOn ? 'room__ico--cam' : 'room__ico--cam-off'" />
+                </view>
+                <view class="room__pact tap" @click.stop="collapsePip">
+                    <view class="room__ico room__ico--shrink" />
                 </view>
             </view>
 
             <!--
-                收起态：竖条，只有两个图标 —— 上麦克风、下挂断。
+                收起态：横向胶囊，三个按钮（麦克风 / 挂断 / 展开）。
 
-                为什么收起态带挂断而展开态不带：
-                全屏时页面的通话控制条是隐藏的，收起态若不给挂断入口，
-                用户在全屏里就彻底没法挂断了。展开态则相反 ——
-                那里最常点的是摄像头开关，挂断混在旁边容易被误触。
+                胶囊本体**不响应点击**，只有按钮改变形态 ——
+                早先它是 40×76 的细竖条且点任意处就展开，
+                拖动时极易误触，一碰就弹开挡画面。
 
-                不显示名字与状态点：40px 宽的条里塞文字会挤成一团，
-                图标本身已足够表达「通话中」。
+                挂断只在这里给：全屏时页面的通话条是隐藏的，
+                收起态若不给挂断入口，用户在全屏里就没法挂断了。
             -->
             <view class="room__mini">
                 <view
                     class="room__mini-act tap"
                     :class="{ 'room__mini-act--off': !audioOn }"
                     @click.stop="toggleAudio">
-                    <view class="room__ico room__ico--mic" :class="{ 'is-off': !audioOn }" />
+                    <view class="room__ico" :class="audioOn ? 'room__ico--mic' : 'room__ico--mic-off'" />
                 </view>
                 <view class="room__mini-act room__mini-act--hangup tap" @click.stop="endCall">
                     <view class="room__ico room__ico--hangup" />
+                </view>
+                <view class="room__mini-act tap" @click.stop="expandPip">
+                    <view class="room__ico room__ico--expand" />
                 </view>
             </view>
         </view>
@@ -319,86 +320,86 @@ const screenH = ref(667);
 const isLandscapeScreen = computed(() => screenW.value > screenH.value);
 
 /**
- * 收起态：竖条，上麦克风、下挂断两个图标。
- * 尺寸 = 两键 24×2 + 间距 10 + 上下内边距 8 ≈ 66，取 76 稍留余量。
+ * 收起态：横向胶囊，三个按钮（麦克风 / 挂断 / 展开）。
+ *
+ * 做成横向且**不响应整条点击**：
+ * 早先是 40×76 的竖条，点任意处就展开 —— 它又小又贴着边缘，
+ * 拖动时极易误触，一碰就弹开挡画面。现在只有按钮能改变形态。
  */
-const PIP_MINI_W = 40;
-const PIP_MINI_H = 76;
+const PIP_MINI_W = 104;
+const PIP_MINI_H = 34;
 
 /**
- * 展开态底部按钮组高度（px），与样式里的 &__pip-acts 对应。
- * 按钮 22 + 上下内边距 4×2 ≈ 30。
+ * 展开态的尺寸档位（相对基准宽的倍数）。
+ *
+ * 双击画面循环切换：小 → 中 → 大 → 小。
+ * 基准宽就是**最小档**，即改造前的大小。
  */
+const PIP_SCALES = [1, 1.32, 1.72];
+
+/** 当前尺寸档位下标 */
+const pipScaleIdx = ref(0);
+
+/** 当前缩放倍数，供样式里的 calc() 使用 */
+const pipScale = computed(() => PIP_SCALES[pipScaleIdx.value]);
+
+/** 底部操作条高度（px），随尺寸档位等比放大 */
 const PIP_ACTS_H = 30;
+
+/** 展开态基准宽（px）：横屏略宽，竖屏收窄。 */
+const PIP_BASE_W = computed(() => (isLandscapeScreen.value ? 132 : 112));
 
 /**
  * 展开态宽度（px）。
  *
- * 刻意做得**明显小**于按屏宽能放下的最大值：
- * 用户要的是「视频不要占满」，留位置给主画面。
+ * 上限按屏宽 62% 夹取：最大档在窄屏上会盖住大半个画面，
+ * 再大就没有「边看边聊」的意义了。
  */
 const pipWidth = computed(() => {
     if (pipMini.value) return PIP_MINI_W;
-    return isLandscapeScreen.value ? 132 : 112;
+    const scaled = PIP_BASE_W.value * pipScale.value;
+    return Math.round(Math.min(scaled, screenW.value * 0.62));
 });
 
 /**
  * 展开态高度。
  *
- * 画面区按 3:4 竖版反算（宽 / 0.75）再加底部按钮组 ——
+ * 画面区按 3:4 竖版反算（宽 / 0.75）再加底部操作条 ——
  * 通话是竖构图的半身像，用竖版比例比横版更省侧边空间。
- * 按钮组内嵌在窗口内（非独立浮层），因此必须计入高度。
+ * 操作条内嵌在窗口内（非独立浮层），因此必须计入高度。
  */
 const pipHeight = computed(() => {
     if (pipMini.value) return PIP_MINI_H;
-    return Math.round(pipWidth.value / 0.75) + PIP_ACTS_H;
+    return Math.round(pipWidth.value / 0.75) + Math.round(PIP_ACTS_H * pipScale.value);
 });
 
-/** 悬浮窗内联样式：位置 + 尺寸。 */
+/** 悬浮窗内联样式：位置 + 尺寸 + 缩放系数（供内部 calc 用）。 */
 const pipStyle = computed(() => ({
     left: `${pipX.value}px`,
     top: `${pipY.value}px`,
     width: `${pipWidth.value}px`,
-    height: `${pipHeight.value}px`
+    height: `${pipHeight.value}px`,
+    '--pip-scale': String(pipScale.value)
 }));
-
-/**
- * 悬浮窗水平是否靠右。
- *
- * 展开态宽高比竖版（宽 < 高），贴左或贴右都不影响观感，
- * 但标签文字对齐要跟着变 —— 靠右时文字右对齐更自然。
- */
-const pipAlignRight = computed(() => pipX.value + pipWidth.value / 2 > screenW.value / 2);
 
 /**
  * 把坐标夹在可视区域内。
  *
- * 边距要避开真实的遮挡物：
- *   · 顶部：竖屏有状态栏 + 自定义导航栏，横屏则几乎没有
- *   · 底部：竖屏有通话控制条（随文档流），全屏时须避让播放器进度条
+ * 四周边距只避开真正会挡事的元素：
+ *   · 顶部：竖屏有状态栏 + 自定义导航栏；横屏几乎没有
+ *   · 底部：全屏时避让播放器进度条；竖屏时避让页面下方的通话条
  *
- * **全屏时纵向只允许在上半屏移动**：
- * 全屏是在看影片，窗口拖到下半部分会挡住字幕与进度条。
- * 限制在上半屏既不影响观影，也仍可自由选择左上/右上。
+ * 不再限制「只能在上半屏」—— 用户反馈那样太死板。
+ * 代价是被拖到字幕区时会挡字，但这属于用户自己的选择，
+ * 且随时能拖走，比强行限制更符合直觉。
  */
 function clampPip(x: number, y: number) {
     const padTop = isLandscapeScreen.value ? 8 : 60;
+    // 全屏时底部有一条进度条，留 44 让它不被压住
+    const padBottom = playerFullscreen.value ? 44 : isLandscapeScreen.value ? 8 : 90;
 
     const maxX = Math.max(8, screenW.value - pipWidth.value - 8);
-
-    let maxY;
-    if (playerFullscreen.value) {
-        /*
-         * 上半屏的下界 = 屏高一半 - 窗口高度（窗口底边不越过中线）。
-         * 窗口比半屏还高时该值为负，用 padTop 兜底，
-         * 否则 Math.max 会把可行域压成一条线、拖动直接失效。
-         */
-        const half = Math.round(screenH.value / 2);
-        maxY = Math.max(padTop, half - pipHeight.value);
-    } else {
-        const padBottom = isLandscapeScreen.value ? 8 : 90;
-        maxY = Math.max(padTop, screenH.value - pipHeight.value - padBottom);
-    }
+    const maxY = Math.max(padTop, screenH.value - pipHeight.value - padBottom);
 
     return {
         x: Math.min(Math.max(8, x), maxX),
@@ -477,18 +478,82 @@ function onPipTouchEnd() {
 }
 
 /**
- * 点击画面：切换收起 / 展开（参照微信）。
+ * 双击的判定间隔（毫秒）。
+ * 移动端 WebView 的 dblclick 事件不可靠，这里自己按时间差判定。
+ */
+const DOUBLE_TAP_MS = 320;
+/** 上一次点击的时间戳 */
+let lastTapAt = 0;
+
+/**
+ * 点击画面：双击才切换缩放档位。
  *
- * 必须用 dragMoved 区分「点击」与「拖动」——
+ * 单击不做事 —— 早先单击就收起，拖动或误触会让窗口突然弹开，
+ * 很反直觉。形态切换已收敛到操作条/胶囊上的专用按钮。
+ *
+ * 必须用 dragMoved 区分「点击」与「拖动」：
  * 拖动结束后 WebView 仍会补发一次 click，
- * 不判断的话每次拖完小窗都会自动收起。
+ * 不判断的话每次拖完都会误判成一次点击。
  */
 function onPipTap() {
     if (dragMoved) {
         dragMoved = false;
+        lastTapAt = 0;
         return;
     }
-    togglePipMini();
+
+    const now = Date.now();
+    if (now - lastTapAt > DOUBLE_TAP_MS) {
+        lastTapAt = now;
+        return;
+    }
+
+    // 双击生效：小 → 中 → 大 → 小 循环
+    lastTapAt = 0;
+    cyclePipScale();
+}
+
+/**
+ * 循环切换缩放档位。
+ *
+ * 到达最大档后回到最小档 —— 用户要的是「双击放大、到顶再双击缩小」，
+ * 与其做方向判断（放大中/缩小中两个状态），循环更简单也不会卡住：
+ * 无论当前在哪一档，双击都有确定的下一步。
+ */
+function cyclePipScale() {
+    pipScaleIdx.value = (pipScaleIdx.value + 1) % PIP_SCALES.length;
+    // 尺寸变化后原坐标可能越界，重新夹一次
+    const next = clampPip(pipX.value, pipY.value);
+    pipX.value = next.x;
+    pipY.value = next.y;
+}
+
+/** 收起为胶囊。 */
+function collapsePip() {
+    if (pipMini.value) return;
+    pipMini.value = true;
+    // 胶囊很矮，收起后重新夹取，避免贴近下边缘时超出
+    const next = clampPip(pipX.value, pipY.value);
+    pipX.value = next.x;
+    pipY.value = next.y;
+}
+
+/**
+ * 从胶囊展开。
+ *
+ * 展开后视频容器重新可见，WebView 可能已暂停解码，
+ * 需显式恢复播放，否则画面会停在最后一帧。
+ */
+function expandPip() {
+    if (!pipMini.value) return;
+    pipMini.value = false;
+
+    const next = clampPip(pipX.value, pipY.value);
+    pipX.value = next.x;
+    pipY.value = next.y;
+
+    // 等一帧让 DOM 先完成显示，再下发指令
+    setTimeout(() => rtcRef.value?.resume?.(), 60);
 }
 /** 本地画面是否就绪（用于判断能否广播片源） */
 const localReady = ref(false);
@@ -679,42 +744,6 @@ function onPeerName(payload: { id: string; name: string }) {
 function onLocalReady(_info: any) {
     localReady.value = true;
     if (isHost.value) startBroadcast();
-}
-
-/**
- * 切换收起 / 展开。
- *
- * 收起后统一挪到右上角 —— 竖条只有 40px 宽，贴角最不干扰画面；
- * 展开时沿用收起前所在的一侧，避免用户刚拖到左边、一展开又跳回右边。
- */
-function togglePipMini() {
-    // 记下收起前的水平位置，展开时保持在同一侧
-    const wasLeft = !pipAlignRight.value;
-
-    pipMini.value = !pipMini.value;
-
-    if (pipMini.value) {
-        // 收起：右上角（clamp 会处理全屏时的上半屏限制）
-        pipX.value = Math.max(8, screenW.value - pipWidth.value - 10);
-        const next = clampPip(pipX.value, isLandscapeScreen.value ? 10 : 84);
-        pipX.value = next.x;
-        pipY.value = next.y;
-        return;
-    }
-
-    // 展开：沿用之前所在的一侧
-    const w = pipWidth.value;
-    pipX.value = wasLeft ? 8 : Math.max(8, screenW.value - w - 10);
-    const next = clampPip(pipX.value, pipY.value);
-    pipX.value = next.x;
-    pipY.value = next.y;
-
-    /*
-     * 收起期间视频容器是 display:none，WebView 可能已暂停解码，
-     * 展开后需显式恢复播放，否则画面会停在最后一帧。
-     * 等一帧让 DOM 先完成显示，再下发指令。
-     */
-    setTimeout(() => rtcRef.value?.resume?.(), 60);
 }
 
 /**
@@ -1121,29 +1150,31 @@ onUnload(() => {
         background-color: #000;
     }
 
-    /* ---------- 展开态：内嵌悬浮按钮组 ---------- */
+    /* ---------- 展开态：内嵌操作条 ---------- */
 
     /*
-     * 压在视频下缘，半透明渐变压底。
+     * 压在视频下缘。
      *
      * 内嵌而非独立底部横条：全屏时横条会压住播放器进度条，
      * 也遮挡画面下缘；内嵌在通话窗里则完全不干扰影片。
+     *
+     * 高度与间距随 --pip-scale 等比放大 —— 放大后按钮若不变大，
+     * 画面变大而按钮还是原尺寸会显得失衡、也难点。
      */
     &__pip-acts {
         flex: none;
-        height: 30px;
+        height: calc(30px * var(--pip-scale, 1));
         display: flex;
         align-items: center;
-        /* 两个按钮居中并留间距，不再撑到两侧边缘 */
         justify-content: center;
-        gap: 26px;
+        gap: calc(20px * var(--pip-scale, 1));
         background-color: #14171c;
     }
 
-    /* 单个圆形按钮：尺寸按小窗收紧 */
+    /* 单个圆形按钮 */
     &__pact {
-        width: 22px;
-        height: 22px;
+        width: calc(22px * var(--pip-scale, 1));
+        height: calc(22px * var(--pip-scale, 1));
         border-radius: 50%;
         display: flex;
         align-items: center;
@@ -1157,153 +1188,94 @@ onUnload(() => {
     }
 
     /*
-     * ---------- CSS 绘制的图标 ----------
+     * ---------- 图标：内联 SVG（data URI + mask） ----------
      *
-     * 全部用伪元素画几何形状、颜色继承 currentColor ——
-     * 跨设备渲染完全一致，且状态色（正常白 / 关闭红）只需改 color。
-     * 不用 emoji 与图标字体：两者在 Android WebView 上都不可靠。
+     * 为什么不用 CSS 手绘几何图形：小尺寸下由边框拼出的形状
+     * 边缘会发虚、比例也难调（麦克风的圆头、挂断的话筒都很难看）。
+     *
+     * 也不用 emoji 与图标字体：前者在不同 Android WebView 上
+     * 渲染差异大（彩色/单色/豆腐块），后者要额外加载字体文件。
+     *
+     * 做法：SVG 作为 mask，真实颜色由 background-color 决定，
+     * 于是「正常白色 / 关闭红色」只需切换 CSS，无需两套图形。
      */
     &__ico {
-        position: relative;
-        width: 12px;
-        height: 12px;
-        color: rgba(255, 255, 255, 0.92);
+        width: 14px;
+        height: 14px;
+        background-color: rgba(255, 255, 255, 0.94);
+        -webkit-mask-repeat: no-repeat;
+        mask-repeat: no-repeat;
+        -webkit-mask-position: center;
+        mask-position: center;
+        -webkit-mask-size: contain;
+        mask-size: contain;
     }
 
-    /* 关闭态：图标转红，与按钮底色呼应 */
-    &__ico.is-off {
-        color: #e88b82;
+    /* 麦克风：话筒 + 底座支架 */
+    &__ico--mic {
+        -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Crect x='9' y='2' width='6' height='11' rx='3'/%3E%3Cpath d='M5 11a7 7 0 0 0 14 0'/%3E%3Cpath d='M12 18v4'/%3E%3C/svg%3E");
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Crect x='9' y='2' width='6' height='11' rx='3'/%3E%3Cpath d='M5 11a7 7 0 0 0 14 0'/%3E%3Cpath d='M12 18v4'/%3E%3C/svg%3E");
     }
 
-    /* 麦克风：圆头 + 竖杆 + 底座 */
-    &__ico--mic::before {
-        content: '';
-        position: absolute;
-        left: 50%;
-        top: 0;
-        width: 5px;
-        height: 7px;
-        margin-left: -2.5px;
-        border-radius: 2.5px;
-        background-color: currentColor;
+    /* 麦克风（静音）：同一图形叠加一道斜杠 */
+    &__ico--mic-off {
+        -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M15 9.5V5a3 3 0 0 0-5.9-.7'/%3E%3Cpath d='M9 9v2a3 3 0 0 0 4.2 2.7'/%3E%3Cpath d='M5 11a7 7 0 0 0 10.5 6.1'/%3E%3Cpath d='M12 18v4'/%3E%3Cpath d='M3 3l18 18'/%3E%3C/svg%3E");
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M15 9.5V5a3 3 0 0 0-5.9-.7'/%3E%3Cpath d='M9 9v2a3 3 0 0 0 4.2 2.7'/%3E%3Cpath d='M5 11a7 7 0 0 0 10.5 6.1'/%3E%3Cpath d='M12 18v4'/%3E%3Cpath d='M3 3l18 18'/%3E%3C/svg%3E");
     }
 
-    &__ico--mic::after {
-        content: '';
-        position: absolute;
-        left: 50%;
-        bottom: 0;
-        width: 9px;
-        height: 6px;
-        margin-left: -4.5px;
-        border: 1.4px solid currentColor;
-        border-top: 0;
-        border-radius: 0 0 6px 6px;
+    /* 摄像头：机身 + 右侧镜头 */
+    &__ico--cam {
+        -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2' y='6' width='13' height='12' rx='2'/%3E%3Cpath d='M15 10.5l6-3.5v10l-6-3.5'/%3E%3C/svg%3E");
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2' y='6' width='13' height='12' rx='2'/%3E%3Cpath d='M15 10.5l6-3.5v10l-6-3.5'/%3E%3C/svg%3E");
     }
 
-    /* 静音：在麦克风上斜切一道，语义一眼可辨 */
-    &__ico--mic.is-off::after {
-        border: 0;
-        border-top: 1.4px solid currentColor;
-        border-radius: 0;
-        height: 0;
-        bottom: 3px;
-        width: 13px;
-        margin-left: -6.5px;
-        transform: rotate(-45deg);
+    /* 摄像头（关闭）：同一图形叠加斜杠 */
+    &__ico--cam-off {
+        -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10.7 6H13a2 2 0 0 1 2 2v.5l6-3.5v10l-2.6-1.5'/%3E%3Cpath d='M15 15v1a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h1'/%3E%3Cpath d='M3 3l18 18'/%3E%3C/svg%3E");
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10.7 6H13a2 2 0 0 1 2 2v.5l6-3.5v10l-2.6-1.5'/%3E%3Cpath d='M15 15v1a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h1'/%3E%3Cpath d='M3 3l18 18'/%3E%3C/svg%3E");
     }
 
-    /* 摄像头：机身 + 右侧镜头三角 */
-    &__ico--cam::before {
-        content: '';
-        position: absolute;
-        left: 0;
-        top: 2px;
-        width: 8px;
-        height: 8px;
-        border-radius: 1.5px;
-        background-color: currentColor;
+    /* 挂断：话筒横置 */
+    &__ico--hangup {
+        -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23000'%3E%3Cpath d='M12 9c-3.6 0-6.9 1.1-9.6 3.1-.4.3-.5.8-.3 1.2l1.5 2.6c.2.4.7.5 1.1.3l3-1.4c.3-.2.5-.5.5-.9v-1.6c1.2-.3 2.5-.5 3.8-.5s2.6.2 3.8.5v1.6c0 .4.2.7.5.9l3 1.4c.4.2.9.1 1.1-.3l1.5-2.6c.2-.4.1-.9-.3-1.2C18.9 10.1 15.6 9 12 9z'/%3E%3C/svg%3E");
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23000'%3E%3Cpath d='M12 9c-3.6 0-6.9 1.1-9.6 3.1-.4.3-.5.8-.3 1.2l1.5 2.6c.2.4.7.5 1.1.3l3-1.4c.3-.2.5-.5.5-.9v-1.6c1.2-.3 2.5-.5 3.8-.5s2.6.2 3.8.5v1.6c0 .4.2.7.5.9l3 1.4c.4.2.9.1 1.1-.3l1.5-2.6c.2-.4.1-.9-.3-1.2C18.9 10.1 15.6 9 12 9z'/%3E%3C/svg%3E");
     }
 
-    &__ico--cam::after {
-        content: '';
-        position: absolute;
-        right: 0;
-        top: 4px;
-        width: 0;
-        height: 0;
-        border-top: 4px solid transparent;
-        border-bottom: 4px solid transparent;
-        border-right: 4px solid currentColor;
-        transform: rotate(180deg);
+    /* 收起：向下双箭头（窗口缩小） */
+    &__ico--shrink {
+        -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 4l6 6 6-6'/%3E%3Cpath d='M6 13l6 6 6-6'/%3E%3C/svg%3E");
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 4l6 6 6-6'/%3E%3Cpath d='M6 13l6 6 6-6'/%3E%3C/svg%3E");
     }
 
-    /* 摄像头关闭：机身留空，只余描边 */
-    &__ico--cam.is-off::before {
-        background-color: transparent;
-        border: 1.4px solid currentColor;
+    /* 展开：向上双箭头（窗口放大） */
+    &__ico--expand {
+        -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 11l6-6 6 6'/%3E%3Cpath d='M6 20l6-6 6 6'/%3E%3C/svg%3E");
+        mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 11l6-6 6 6'/%3E%3Cpath d='M6 20l6-6 6 6'/%3E%3C/svg%3E");
     }
 
-    &__ico--cam.is-off::after {
-        border-right-color: currentColor;
-        opacity: 0.5;
-    }
-
-    /* 挂断：话筒横置（听筒形），红底上白图标 */
-    &__ico--hangup::before {
-        content: '';
-        position: absolute;
-        left: 1px;
-        top: 5px;
-        width: 10px;
-        height: 3.5px;
-        border-radius: 2px;
-        background-color: currentColor;
-    }
-
-    &__ico--hangup::after {
-        content: '';
-        position: absolute;
-        left: 3px;
-        top: 2px;
-        width: 6px;
-        height: 6px;
-        border: 1.4px solid currentColor;
-        border-radius: 50%;
-        border-color: currentColor transparent transparent transparent;
-    }
-
-    /*
-     * 收起态按钮更小，图标等比缩放。
-     * 用 transform 缩放而不是改尺寸：几何比例保持一致，不必重画。
-     */
-    &__mini-act &__ico {
-        transform: scale(0.92);
-    }
-
-    /* ---------- 收起态：竖向小条，两个图标 ---------- */
+    /* ---------- 收起态：横向胶囊 ---------- */
 
     &__mini {
         display: none;
     }
 
     /*
-     * 上下分布：上=麦克风、下=挂断。
-     * gap 保证两键之间留出空隙，避免误触到相邻按钮。
+     * 三个按钮横向排列：麦克风 / 挂断 / 展开。
+     * 整条胶囊**不响应点击**，只有按钮能改变形态 ——
+     * 早先是细竖条且点任意处就展开，拖动时极易误触。
      */
     &__pip--mini .room__mini {
         display: flex;
         flex: 1;
-        flex-direction: column;
         align-items: center;
         justify-content: center;
-        gap: 10px;
-        padding: 4px 0;
+        gap: 8px;
+        padding: 0 6px;
     }
 
     &__mini-act {
-        width: 24px;
-        height: 24px;
+        width: 26px;
+        height: 26px;
         border-radius: 50%;
         display: flex;
         align-items: center;
@@ -1318,6 +1290,12 @@ onUnload(() => {
     /* 挂断：红底，与其他键明确区分 */
     &__mini-act--hangup {
         background-color: #b4534b;
+    }
+
+    /* 胶囊里的图标小一号，26px 的按钮放 14px 图标会顶边 */
+    &__mini-act &__ico {
+        width: 13px;
+        height: 13px;
     }
 
     /* ---------- 通话控制条 ---------- */
