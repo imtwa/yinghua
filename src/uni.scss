@@ -1,0 +1,36 @@
+/**
+ * uni-app 全局 SCSS 变量。
+ *
+ * 组件中如需引用，直接在 <style lang="scss"> 里使用这些变量
+ * （uni-app 会自动注入本文件）。
+ */
+
+/* 主色：琥珀金，呼应放映机的光 */
+$yh-brand: #f0a63c;
+$yh-brand-light: #ffc46b;
+$yh-brand-dark: #c47f1f;
+
+/* 分层深灰（影院暗色基调） */
+$yh-ink-900: #0b0d10;
+$yh-ink-800: #14171c;
+$yh-ink-700: #1d2128;
+$yh-ink-600: #2a2f38;
+$yh-ink-500: #3d434e;
+$yh-ink-400: #6b7280;
+
+/* 文字 */
+$yh-text-primary: #e8eaed;
+$yh-text-secondary: #c9ced6;
+$yh-text-muted: #6b7280;
+
+/* 圆角 */
+$yh-radius-sm: 8rpx;
+$yh-radius-md: 16rpx;
+$yh-radius-lg: 32rpx;
+
+/* 字号 */
+$yh-font-xs: 22rpx;
+$yh-font-sm: 26rpx;
+$yh-font-md: 30rpx;
+$yh-font-lg: 36rpx;
+$yh-font-xl: 44rpx;

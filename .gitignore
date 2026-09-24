@@ -1,0 +1,49 @@
+# 依赖
+node_modules/
+dist/
+
+# 打包产物目录
+# 注意：unpackage/res/icons/ 里的应用图标是**源资源**（由
+# scripts/gen-icons.mjs 生成、随代码分发），故意不忽略 —— 否则
+# 换台机器打包会退回 uni-app 默认图标。
+unpackage/*
+!unpackage/res/
+unpackage/res/*
+!unpackage/res/icons/
+
+# 构建产物
+*.log
+.npm
+.DS_Store
+Thumbs.db
+
+# 调试临时文件（dev server 输出重定向等）
+tmp-*.txt
+tmp-*.log
+tmp-*.mjs
+tmp-*.py
+# 临时目录（如抓取的测试分片、离线样本）
+tmp-*/
+# 排查用的一次性产物
+*.tmp
+*.bak
+# Vite 中断时留下的配置转译产物（含绝对路径，不该入库）
+vite.config.ts.timestamp-*.mjs
+
+# 编辑器
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+.hbuilderx/
+
+# 本地环境覆盖
+env/.env.local
+
+# 自动生成
+src/types/auto-import.d.ts
+src/types/components.d.ts
+src/types/uni-pages.d.ts
+src/pages.json
+src/manifest.json
