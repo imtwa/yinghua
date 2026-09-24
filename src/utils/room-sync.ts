@@ -86,28 +86,76 @@ export interface ActiveRoom {
     /** 影片信息（房主选好片后写入，供返回房间时恢复） */
     vodId?: number;
     index?: number;
+    /** 记录写入时间戳，用于判断是否还在同一次使用会话内 */
+    savedAt?: number;
+    /** 写入时所在的运行会话标识（见 SESSION_ID） */
+    session?: string;
 }
+
+/**
+ * 本次 App 运行的会话标识。
+ *
+ * 模块级常量，**每次 App 启动都会重新生成** ——
+ * 因此「记录里的 session 与当前不一致」就等价于「App 重启过」。
+ *
+ * 为什么不能只靠时间戳：用户 swipe 掉 App 立刻重开（几秒内），
+ * 时间戳仍在有效期内，记录会被误判为可用，
+ * 表现为「退出重进后开一个房间，却残留上一次的视频」。
+ * 会话标识没有这个时间窗口问题。
+ */
+const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+/**
+ * 房间记录的兜底有效期（毫秒）。
+ *
+ * 会话标识已能覆盖「重启 App」的场景，这个 TTL 只用来兜住
+ * 长时间挂后台（JS 上下文未重建但已隔夜）的情况。
+ * 取 6 小时：足够一次连续观影，又不会让陈旧记录跨天存活。
+ */
+const ROOM_TTL = 6 * 60 * 60 * 1000;
 
 /**
  * 记住当前房间。
  *
- * 为什么需要：房主可能中途回首页挑片，或从播放页点「一起看」
+ * 为什么需要：房主可能中途去选片页挑片，或从播放页点「一起看」
  * 再接回原房间。房间号若只存在页面局部状态里，一离开就丢，
  * 回来会新建房间、观众找不到人。
  */
 export function saveActiveRoom(info: ActiveRoom) {
     try {
-        uni.setStorageSync(ROOM_KEY, info);
+        uni.setStorageSync(ROOM_KEY, { ...info, savedAt: Date.now(), session: SESSION_ID });
     } catch {
         /* 忽略 */
     }
 }
 
-/** 读取当前房间（无则返回 null）。 */
+/**
+ * 读取当前房间（无、已过期、或不属于本次运行会话时返回 null）。
+ *
+ * 返回 null 即视为无记录 —— 调用方会因此新建房间，
+ * 这正是「重启 App 后点开一个，应该是全新房间」的预期行为。
+ */
 export function loadActiveRoom(): ActiveRoom | null {
     try {
         const v = uni.getStorageSync(ROOM_KEY) as ActiveRoom | '';
-        if (v && typeof v === 'object' && isRoomCode(v.roomId)) return v;
+        if (!v || typeof v !== 'object' || !isRoomCode(v.roomId)) return null;
+
+        /*
+         * 会话不符 → App 重启过 → 记录作废。
+         * 这条是解决「退出重进 App 后残留上次视频」的关键：
+         * 记录存在本地存储里，重启不会自动清除，只能靠会话标识识别。
+         */
+        if (v.session !== SESSION_ID) {
+            clearActiveRoom();
+            return null;
+        }
+
+        // 时间兜底：长时间挂后台（JS 上下文未重建）也算过期
+        if (!v.savedAt || Date.now() - v.savedAt > ROOM_TTL) {
+            clearActiveRoom();
+            return null;
+        }
+        return v;
     } catch {
         /* 忽略 */
     }

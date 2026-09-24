@@ -2181,6 +2181,26 @@ export default {
             // 面板内部点击不触发容器上的显隐切换
             epPanel.addEventListener('click', e => e.stopPropagation());
 
+            /*
+             * 阻断触摸事件冒泡。
+             *
+             * 手势监听绑在 box 上（亮度/音量、右滑退全屏），而弹窗是它的
+             * 子元素 —— 手指在弹窗里上下滑时事件会冒泡上去，
+             * 被判定成「调亮度」并 preventDefault，弹窗的滚动被整个吃掉，
+             * 表现为「选集面板滚不动」。
+             *
+             * 这里把 touchmove 拦在弹窗内：既不冒泡给手势层，
+             * 也不阻止默认行为，让 .vp-eps-body 的 overflow-y 正常工作。
+             */
+            const stopTouch = e => e.stopPropagation();
+            epPanel.addEventListener('touchstart', stopTouch, { passive: true });
+            epPanel.addEventListener('touchmove', stopTouch, { passive: true });
+            epPanel.addEventListener('touchend', stopTouch, { passive: true });
+            // 遮罩同样阻断：点空白处应只收起面板，不顺手把亮度也调了
+            epMask.addEventListener('touchstart', stopTouch, { passive: true });
+            epMask.addEventListener('touchmove', stopTouch, { passive: true });
+            epMask.addEventListener('touchend', stopTouch, { passive: true });
+
             // 加载浮层：缓冲进度 + 网速
             const load = document.createElement('div');
             load.className = 'vp-load';

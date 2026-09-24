@@ -40,6 +40,14 @@ export default {
             seed: Math.floor(Math.random() * 100000000),
             /** 渲染层指令：'start' | 'stop' | 'mute' | 'unmute' | 'camera:on' | 'camera:off' | 'switchcamera' | 'front' | 'back' | 'destroy' */
             command: '',
+            /**
+             * 待发送的指令队列。
+             *
+             * command 是字符串属性，同一帧内连续赋值会互相覆盖；
+             * 一次操作要发多条指令时（如切集：先 source 再 state）
+             * 必须排队，否则前一条会丢。
+             */
+            cmdQueue: [],
             /** 连接状态：idle / connecting / connected / error */
             status: 'idle',
             /** 远端是否已接入 */
@@ -64,13 +72,51 @@ export default {
     watch: {
         command(val) {
             if (val) {
+                /*
+                 * 消费后复位，保证同名指令可重复触发。
+                 *
+                 * 注意：复位是异步的（$nextTick），因此**同一帧内连续调用
+                 * 两次命令会互相覆盖** —— 后一次赋值把前一次顶掉，
+                 * 前一条指令永远送不到渲染层。
+                 *
+                 * 这正是「切集后观众不跟随」的根因：切集时先 pushSource()
+                 * 再 broadcast(state)，两条指令同帧发出，source 被覆盖，
+                 * 观众只收到进度、收不到集数变化。
+                 * 上层因此改用 sendCommand() 排队发送（见 methods）。
+                 */
                 this.$nextTick(() => {
-                    this.command = '';
+                    if (this.command === val) {
+                        this.command = '';
+                        // 复位后立刻发队列里的下一条，避免指令滞留
+                        this.$nextTick(() => this.flushCommandQueue());
+                    }
                 });
             }
         }
     },
     methods: {
+        /**
+         * 把命令排进队列，逐条发送。
+         *
+         * 每条指令在前一条被渲染层消费后再发出，避免同帧覆盖。
+         * 上层凡是「一次操作要发多条指令」的场景都应走这里。
+         */
+        sendCommand(cmd) {
+            if (!cmd) return;
+            if (this.command) {
+                // 上一条还没被消费，先排队
+                this.cmdQueue.push(cmd);
+                return;
+            }
+            this.command = cmd;
+        },
+
+        /** 队列里还有指令时继续发送。 */
+        flushCommandQueue() {
+            if (this.command) return;
+            const next = this.cmdQueue.shift();
+            if (next) this.command = next;
+        },
         /** 渲染层唯一回调入口。 */
         onRenderEvent(payload) {
             const { event, data } = payload || {};
@@ -89,23 +135,23 @@ export default {
 
         /** 开始通话（请求摄像头/麦克风并连接信令）。 */
         start() {
-            this.command = 'start';
+            this.sendCommand('start');
         },
         /** 结束通话并释放设备。 */
         stop() {
-            this.command = 'stop';
+            this.sendCommand('stop');
         },
         /** 开关麦克风。 */
         setAudio(on) {
-            this.command = on ? 'unmute' : 'mute';
+            this.sendCommand(on ? 'unmute' : 'mute');
         },
         /** 开关摄像头。 */
         setVideo(on) {
-            this.command = on ? 'camera:on' : 'camera:off';
+            this.sendCommand(on ? 'camera:on' : 'camera:off');
         },
         /** 前后摄像头切换（移动端）。 */
         switchCamera() {
-            this.command = 'switchcamera';
+            this.sendCommand('switchcamera');
         },
         /**
          * 恢复视频播放。
@@ -114,7 +160,7 @@ export default {
          * 展开后需显式 play 一次，否则画面停在最后一帧。
          */
         resume() {
-            this.command = 'resume';
+            this.sendCommand('resume');
         },
         /**
          * 向所有已连接的对端广播一条消息。
@@ -122,16 +168,28 @@ export default {
          * 渲染层不能定义在 script setup 里，逻辑层也无法直接调它的方法，
          * 故复用既有的 command 通道：消息 JSON 经 encodeURIComponent
          * 编码后传递，避免内容里的特殊字符破坏指令格式。
+         *
+         * 必须走 sendCommand 排队：一次操作常要连发多条
+         * （如切集先 source 再 state），直接写 this.command
+         * 会让后一条覆盖前一条，导致集数变化丢失。
          */
         broadcast(msg) {
             try {
-                this.command = `broadcast:${encodeURIComponent(JSON.stringify(msg))}`;
+                this.sendCommand(`broadcast:${encodeURIComponent(JSON.stringify(msg))}`);
             } catch (e) {
                 /* 不可序列化的内容直接丢弃 */
             }
         },
-        /** 销毁。 */
+        /**
+         * 销毁通话。
+         *
+         * **刻意不走队列**：销毁必须立即执行。
+         * 若排在队尾，而前面还有未消费的指令（或组件正要卸载），
+         * 它可能永远发不出去 —— 摄像头指示灯不灭、麦克风持续占用。
+         * 清空队列，确保销毁是最后一个动作。
+         */
         destroy() {
+            this.cmdQueue = [];
             this.command = 'destroy';
         }
     }

@@ -23,6 +23,9 @@
                 @landscapechange="onLandscapeChange"
                 @orientationchange="onOrientationChange"
                 @episodechange="onEpisodeChange"
+                @play="onHostPlay"
+                @pause="onHostPause"
+                @seeked="onHostSeek"
                 @ended="onEnded" />
 
             <view v-else class="room__loading">
@@ -318,6 +321,15 @@ const rtcRef = ref<any>(null);
 const roomId = ref('');
 const isHost = ref(false);
 const following = ref(true);
+
+/**
+ * 观众侧当前是否处于「正在播放」状态。
+ *
+ * 用途是**去重**：房主每 3 秒广播一次 state，
+ * 若每次都无脑下发 play/pause 指令，会把播放器反复打断
+ * （尤其 play 会触发重新缓冲）。只在状态真正翻转时才下发。
+ */
+let isGuestPlaying = false;
 const resolving = ref(false);
 const syncHint = ref('');
 
@@ -703,9 +715,20 @@ const statusText = computed(() => {
 
 /* ---------------- 片源 ---------------- */
 
+/**
+ * 解析当前集的播放地址。
+ *
+ * **切集时绝不能先 `playStore.reset()`。**
+ * reset 会清空 playUrl，使页面上的 `v-if="playStore.playUrl"` 判定为假，
+ * 播放器组件被销毁重建 —— 全屏状态随之丢失，
+ * 表现为「全屏里选一集，画面退出全屏重新加载」。
+ * （播放页 play.vue 里有同样的说明，房间页此前漏了。）
+ *
+ * 切集只是换地址，`setResolved` 会直接覆盖，不需要先清空。
+ * 只有**换片**才需要清（见 applyPendingPick），因为要丢弃整部影片的状态。
+ */
 async function resolve() {
     resolving.value = true;
-    playStore.reset();
     try {
         const current = collections.value[currentIndex.value];
         if (!current) throw new Error('无可用剧集');
@@ -722,6 +745,13 @@ async function resolve() {
 async function loadDetail() {
     try {
         const res = await getVodDetail(vodId.value);
+        /*
+         * 影片名必须在这里落地。
+         * 早先只赋了 collections，vodName 一直是空串 ——
+         * 全屏顶部栏的标题因此始终为空（只剩返回键），
+         * 「正在看」那一栏也显示不出片名。
+         */
+        if (res?.vod_name) vodName.value = res.vod_name;
         collections.value = res?.vod_collection || [];
         await resolve();
     } catch {
@@ -750,15 +780,15 @@ function switchToEpisode(index: number, silent = false) {
     if (!silent && isHost.value) {
         pushSource();
         /*
-         * 新的一集从 0 秒开始，进度基准也要立刻重置。
+         * 新的一集从 0 秒开始，进度基准立刻重置。
          *
-         * 注意用 `broadcast` 而不是 `broadcastState` ——
-         * 后者只定义在渲染层，逻辑层（本页）调不到它。
-         * `broadcast` 是逻辑层方法，内部走指令通道送达渲染层。
+         * `playing` 取房主当前的真实状态，不写死 true ——
+         * 若房主在暂停状态下切集，观众不该被强制播放起来。
+         * 用逻辑层的 broadcastState（内部走 broadcast 指令通道）。
          */
-        const state = { playing: true, position: 0, updatedAt: Date.now() };
+        const state = { playing: playerRef.value?.isPlaying?.() ?? true, position: 0, updatedAt: Date.now() };
         playStore.updateRemoteState(state);
-        rtcRef.value?.broadcast?.({ type: 'state', ...state });
+        broadcastState(state);
     }
 }
 
@@ -795,12 +825,11 @@ function startBroadcast() {
     stopBroadcast();
 
     const push = () => {
-        const position = playerRef.value?.getCurrentTime?.() || 0;
-        const state = { playing: true, position, updatedAt: Date.now() };
+        const state = currentPlayState();
         playStore.updateRemoteState(state);
 
         pushSource();
-        rtcRef.value?.broadcastState(state);
+        broadcastState(state);
         // 倍速随状态一起下发：它是「全体一致」的参数
         rtcRef.value?.broadcast?.({ type: 'rate', rate: playbackRate.value });
         /*
@@ -813,6 +842,45 @@ function startBroadcast() {
 
     push();
     broadcastTimer = setInterval(push, 3000);
+}
+
+/**
+ * 采集房主当前的播放状态。
+ *
+ * `playing` 必须取自播放器真实状态，不能写死 true ——
+ * 早先硬编码导致房主暂停后仍广播「正在播放」，
+ * 观众侧会继续按「已流逝时间」推算进度，越推越离谱。
+ */
+function currentPlayState() {
+    const position = playerRef.value?.getCurrentTime?.() || 0;
+    const playing = playerRef.value?.isPlaying?.() ?? true;
+    return { playing, position, updatedAt: Date.now() };
+}
+
+/**
+ * 广播播放状态。
+ *
+ * 用逻辑层的 `broadcast` 而不是 `broadcastState`：
+ * 后者只定义在渲染层，逻辑层（本页）调不到 ——
+ * 早先这里写的是 `rtcRef.value?.broadcastState(state)`，
+ * 可选链让调用静默失败，状态根本没发出去。
+ */
+function broadcastState(state: { playing: boolean; position: number; updatedAt: number }) {
+    if (!isHost.value) return;
+    rtcRef.value?.broadcast?.({ type: 'state', ...state });
+}
+
+/**
+ * 房主的即时同步入口。
+ *
+ * 播放/暂停/快进都调它：立刻把当前状态推给观众，
+ * 不等 3 秒轮播周期 —— 否则按了暂停对方还在播，观感很差。
+ */
+function syncNow() {
+    if (!isHost.value) return;
+    const state = currentPlayState();
+    playStore.updateRemoteState(state);
+    broadcastState(state);
 }
 
 function stopBroadcast() {
@@ -847,6 +915,36 @@ function onTimeUpdate(payload: { currentTime: number }) {
 function onEnded() {
     const next = currentIndex.value + 1;
     if (next < collections.value.length) switchToEpisode(next);
+}
+
+/* ---------------- 播放控制同步 ---------------- */
+
+/**
+ * 房主开始播放 → 立刻广播。
+ *
+ * 早先只靠 3 秒轮播，观众最多要等 3 秒才跟上；
+ * 暂停更是完全同步不了（广播里 playing 被写死为 true）。
+ */
+function onHostPlay() {
+    syncNow();
+}
+
+/** 房主暂停 → 立刻广播，让观众一起停下。 */
+function onHostPause() {
+    syncNow();
+}
+
+/**
+ * 房主拖动进度条 → 立刻广播新的位置。
+ *
+ * @param target 松手时跳转到的秒数
+ */
+function onHostSeek(target: number) {
+    if (!isHost.value) return;
+    // 用播放器给的目标值，比读 currentTime 更准（后者可能还没更新）
+    const state = { playing: playerRef.value?.isPlaying?.() ?? true, position: Number(target) || 0, updatedAt: Date.now() };
+    playStore.updateRemoteState(state);
+    broadcastState(state);
 }
 
 /* ---------------- 通话 ---------------- */
@@ -951,17 +1049,44 @@ function onChannelMessage(msg: any) {
         vodId.value = Number(msg.vodId);
         currentIndex.value = Number(msg.index) || 0;
         vodName.value = msg.vodName || '';
+        /*
+         * 换片/切集后播放会从新位置开始，复位播放状态标记 ——
+         * 否则紧接着收到的 state 会被去重逻辑挡住，
+         * 观众端不会重新 play，画面停在首帧。
+         */
+        isGuestPlaying = false;
         loadDetail();
         return;
     }
 
     if (msg.type === 'state') {
         if (isHost.value) return;   // 房主是时间基准，不跟随
+
+        const playing = !!msg.playing;
         playStore.updateRemoteState({
-            playing: !!msg.playing,
+            playing,
             position: Number(msg.position) || 0,
             updatedAt: Number(msg.updatedAt) || Date.now()
         });
+
+        /*
+         * 真正驱动播放器 —— 早先只记录状态、不执行动作，
+         * 所以房主按了暂停，观众画面照样在跑。
+         *
+         * 播放与暂停都直接下发指令：
+         *   · 暂停必须立刻生效，晚一点对方就多看了几秒
+         *   · 播放也让本地跟着走，具体位置由 onTimeUpdate 的对齐逻辑纠偏
+         *     （这里不 seek，避免每次广播都跳一下）
+         */
+        if (playing) {
+            if (!isGuestPlaying) {
+                isGuestPlaying = true;
+                playerRef.value?.play?.();
+            }
+        } else {
+            isGuestPlaying = false;
+            playerRef.value?.pause?.();
+        }
         return;
     }
 
@@ -1300,6 +1425,19 @@ onUnload(() => {
     rtcRef.value?.destroy?.();
     playStore.leaveRoom();
     playStore.reset();
+
+    /*
+     * 离开房间页即清除记录。
+     *
+     * 这条记录只服务于「房主去选片页再返回」这类**同一次会话内的跨页往返**
+     * —— 那种情况不会触发 onUnload（页面仍在栈里）。
+     * 一旦 onUnload 触发，说明用户真的离开了房间，记录就该失效，
+     * 否则下次点「开一个」会复用已经散掉的房间号。
+     *
+     * 早先 clearActiveRoom 定义了却从未被调用，记录只能靠 TTL 过期，
+     * 因此重启 App 后点「开一个」会残留上一次的房间与影片。
+     */
+    clearActiveRoom();
 });
 </script>
 
