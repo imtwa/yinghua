@@ -5,7 +5,8 @@
         <!--
             播放器区。
             通话悬浮窗不在这一层 —— 见下方根层级浮层。
-        -->        <view class="room__stage">
+        -->
+        <view class="room__stage">
             <yh-player
                 v-if="playStore.playUrl"
                 ref="playerRef"
@@ -32,7 +33,7 @@
         </view>
 
         <!--
-            通话悬浮窗（参照抖音「一起刷」）。
+            通话悬浮窗（参照腾讯会议小窗）。
 
             刻意放在**页面根层级**而不是播放器区域内部：
             播放器全屏时是 fixed + z-index 9999，且 .room__stage 会形成
@@ -40,8 +41,11 @@
             才能保证「无论播放器是否全屏都在最上层」。
 
             两种形态：
-              收起 —— 只剩一条名字胶囊，几乎不挡画面
-              展开 —— 小窗视频 + 标题栏，按方向停靠边缘
+              展开 —— 视频 + 底部悬浮按钮组（麦克风 / 摄像头 / 翻转 / 挂断）
+              收起 —— 一条侧边小条，静音 / 挂断常驻，不占画面
+
+            按钮**内嵌在视频里**而非另起一条底部浮层：
+            全屏时底部横条会压住播放器的进度条，且遮挡画面下缘。
 
             注意：收起态**不能**用 v-if 卸载 yh-rtc ——
             那是 renderjs 组件，卸载等于挂断通话。
@@ -72,28 +76,66 @@
                 @error="onCallError" />
 
             <!--
-                收起态内容：名字 + 通话状态点。
-                展开态整体隐藏（含视频），只留这一条。
+                展开态的悬浮按钮组，压在视频下缘。
+
+                只保留**麦克风 + 摄像头**两个开关（参照微信）：
+                挂断在这个应用里等同于「退出房间」，主操作已由页面的
+                通话控制条承担，放进小窗里既重复又容易误触 ——
+                用户本想关摄像头却点到挂断，房间就散了。
+
+                收起改由「点击画面」触发（也是微信的做法），不占按钮位。
+
+                图标用 CSS 绘制而非 emoji：emoji 在不同 Android WebView 上
+                渲染差异大（有的彩色、有的单色、个别机型显示豆腐块），
+                且彩色图形与这里的暗色小按钮不协调。
+                CSS 图形跨设备完全一致，颜色还能随状态继承。
             -->
-            <view class="room__pip-mini">
-                <view class="room__pip-dot" :class="{ 'room__pip-dot--live': hasRemote }" />
-                <text class="room__pip-mini-name">{{ miniLabel }}</text>
+            <view class="room__pip-acts" @click.stop>
+                <view
+                    class="room__pact tap"
+                    :class="{ 'room__pact--off': !audioOn }"
+                    @click.stop="toggleAudio">
+                    <view class="room__ico room__ico--mic" :class="{ 'is-off': !audioOn }" />
+                </view>
+                <view
+                    class="room__pact tap"
+                    :class="{ 'room__pact--off': !videoOn }"
+                    @click.stop="toggleVideo">
+                    <view class="room__ico room__ico--cam" :class="{ 'is-off': !videoOn }" />
+                </view>
             </view>
 
-            <!-- 展开态标题栏：昵称 + 收起 -->
-            <view class="room__pip-bar">
-                <text class="room__pip-name">{{ pipTitle }}</text>
-                <text class="room__pip-mini-text">收起</text>
+            <!--
+                收起态：竖条，只有两个图标 —— 上麦克风、下挂断。
+
+                为什么收起态带挂断而展开态不带：
+                全屏时页面的通话控制条是隐藏的，收起态若不给挂断入口，
+                用户在全屏里就彻底没法挂断了。展开态则相反 ——
+                那里最常点的是摄像头开关，挂断混在旁边容易被误触。
+
+                不显示名字与状态点：40px 宽的条里塞文字会挤成一团，
+                图标本身已足够表达「通话中」。
+            -->
+            <view class="room__mini">
+                <view
+                    class="room__mini-act tap"
+                    :class="{ 'room__mini-act--off': !audioOn }"
+                    @click.stop="toggleAudio">
+                    <view class="room__ico room__ico--mic" :class="{ 'is-off': !audioOn }" />
+                </view>
+                <view class="room__mini-act room__mini-act--hangup tap" @click.stop="endCall">
+                    <view class="room__ico room__ico--hangup" />
+                </view>
             </view>
         </view>
 
         <!--
             通话控制条。
 
-            全屏时改为浮层（fixed + 高 z-index）—— 否则会被 z-index 9999 的
-            全屏播放器整个盖住，用户在全屏里既看不到画面也点不到挂断键。
+            **仅非全屏时显示**：全屏时同样的按钮已内嵌在通话悬浮窗里，
+            若再浮一条横条会与它重复，并且横条会压住播放器的进度条。
         -->
-        <view class="room__call-bar" :class="{ 'room__call-bar--float': playerFullscreen }">
+        <view v-if="!playerFullscreen" class="room__call-bar">
             <view v-if="!callEnabled" class="room__bar-btn room__bar-btn--primary tap tap-solid" @click="startCall">
                 <text class="room__bar-text room__bar-text--primary">开启视频通话</text>
             </view>
@@ -276,18 +318,24 @@ const screenH = ref(667);
 /** 当前是否横屏（横屏时悬浮窗停靠右侧，竖屏停靠上方） */
 const isLandscapeScreen = computed(() => screenW.value > screenH.value);
 
-/** 收起态：一条名字胶囊。 */
-const PIP_MINI_W = 84;
-const PIP_MINI_H = 26;
-/** 展开态标题栏高度（px），与样式里的 &__pip-bar 对应 */
-const PIP_BAR_H = 26;
+/**
+ * 收起态：竖条，上麦克风、下挂断两个图标。
+ * 尺寸 = 两键 24×2 + 间距 10 + 上下内边距 8 ≈ 66，取 76 稍留余量。
+ */
+const PIP_MINI_W = 40;
+const PIP_MINI_H = 76;
+
+/**
+ * 展开态底部按钮组高度（px），与样式里的 &__pip-acts 对应。
+ * 按钮 22 + 上下内边距 4×2 ≈ 30。
+ */
+const PIP_ACTS_H = 30;
 
 /**
  * 展开态宽度（px）。
  *
  * 刻意做得**明显小**于按屏宽能放下的最大值：
  * 用户要的是「视频不要占满」，留位置给主画面。
- * 竖屏 112 / 横屏 132，约等于手机上一张缩略图的宽度。
  */
 const pipWidth = computed(() => {
     if (pipMini.value) return PIP_MINI_W;
@@ -297,12 +345,13 @@ const pipWidth = computed(() => {
 /**
  * 展开态高度。
  *
- * 画面区按 3:4 竖版反算（宽 / 0.75）再加标题栏 ——
+ * 画面区按 3:4 竖版反算（宽 / 0.75）再加底部按钮组 ——
  * 通话是竖构图的半身像，用竖版比例比横版更省侧边空间。
+ * 按钮组内嵌在窗口内（非独立浮层），因此必须计入高度。
  */
 const pipHeight = computed(() => {
     if (pipMini.value) return PIP_MINI_H;
-    return Math.round(pipWidth.value / 0.75) + PIP_BAR_H;
+    return Math.round(pipWidth.value / 0.75) + PIP_ACTS_H;
 });
 
 /** 悬浮窗内联样式：位置 + 尺寸。 */
@@ -326,24 +375,31 @@ const pipAlignRight = computed(() => pipX.value + pipWidth.value / 2 > screenW.v
  *
  * 边距要避开真实的遮挡物：
  *   · 顶部：竖屏有状态栏 + 自定义导航栏，横屏则几乎没有
- *   · 底部：竖屏有通话控制条（随文档流），全屏时它变成底部浮层，
- *     两者都要留出高度，否则悬浮窗会被压在控制条下面点不到
+ *   · 底部：竖屏有通话控制条（随文档流），全屏时须避让播放器进度条
+ *
+ * **全屏时纵向只允许在上半屏移动**：
+ * 全屏是在看影片，窗口拖到下半部分会挡住字幕与进度条。
+ * 限制在上半屏既不影响观影，也仍可自由选择左上/右上。
  */
 function clampPip(x: number, y: number) {
     const padTop = isLandscapeScreen.value ? 8 : 60;
 
-    /*
-     * 底部让位：
-     *   全屏 —— 控制条是居中的底部浮层（底距 44 + 自身高约 36），留 88
-     *   竖屏 —— 控制条与底部 tabbar 都在下方，留足 90
-     *   横屏非全屏 —— 实际不会出现（横屏只在全屏内发生），留小边即可
-     */
-    let padBottom = 8;
-    if (playerFullscreen.value) padBottom = 88;
-    else if (!isLandscapeScreen.value) padBottom = 90;
-
     const maxX = Math.max(8, screenW.value - pipWidth.value - 8);
-    const maxY = Math.max(padTop, screenH.value - pipHeight.value - padBottom);
+
+    let maxY;
+    if (playerFullscreen.value) {
+        /*
+         * 上半屏的下界 = 屏高一半 - 窗口高度（窗口底边不越过中线）。
+         * 窗口比半屏还高时该值为负，用 padTop 兜底，
+         * 否则 Math.max 会把可行域压成一条线、拖动直接失效。
+         */
+        const half = Math.round(screenH.value / 2);
+        maxY = Math.max(padTop, half - pipHeight.value);
+    } else {
+        const padBottom = isLandscapeScreen.value ? 8 : 90;
+        maxY = Math.max(padTop, screenH.value - pipHeight.value - padBottom);
+    }
+
     return {
         x: Math.min(Math.max(8, x), maxX),
         y: Math.min(Math.max(padTop, y), maxY)
@@ -351,31 +407,18 @@ function clampPip(x: number, y: number) {
 }
 
 /**
- * 默认停靠位置。
+ * 默认停靠位置：贴右上角。
  *
- * 参照抖音「一起刷」：小窗靠边、不压画面中心。
- *   · 竖屏 —— 贴右上角（主画面在下方，顶部留给小窗）
- *   · 横屏 —— 贴右侧居中（主画面横向铺开，右侧竖条最省视线）
+ * 不区分方向与形态 —— 通话窗在两种形态下都是「竖向长条」，
+ * 右上角既避开播放器常用的中心与底部区域，也不挡字幕。
+ * 最终位置仍会过一遍 clampPip，全屏时自然被限制在上半屏。
  */
 function placePipDefault() {
-    const w = pipWidth.value;
-    // 收起态统一贴右上角即可，不区分方向
-    if (pipMini.value) {
-        pipX.value = Math.max(8, screenW.value - w - 10);
-        pipY.value = isLandscapeScreen.value ? 10 : 84;
-        pipPlaced.value = true;
-        return;
-    }
-
-    pipX.value = Math.max(8, screenW.value - w - 10);
-    if (isLandscapeScreen.value) {
-        // 右侧垂直居中
-        const mid = Math.round((screenH.value - pipHeight.value) / 2);
-        const next = clampPip(pipX.value, mid);
-        pipY.value = next.y;
-    } else {
-        pipY.value = 76;
-    }
+    pipX.value = Math.max(8, screenW.value - pipWidth.value - 10);
+    pipY.value = isLandscapeScreen.value ? 10 : 84;
+    const next = clampPip(pipX.value, pipY.value);
+    pipX.value = next.x;
+    pipY.value = next.y;
     pipPlaced.value = true;
 }
 
@@ -410,27 +453,36 @@ function onPipTouchMove(e: any) {
 }
 
 /**
- * 结束拖动：吸附到最近的左右边缘。
+ * 结束拖动。
  *
- * 微信小窗就是这个手感 —— 松手后自动贴边，不会停在屏幕正中挡画面。
+ * 展开态吸附到最近的左右边缘（小窗手感）；
+ * 收起态刻意不吸附 —— 它只有 40px 宽，吸边后更容易被误触。
  */
 function onPipTouchEnd() {
     if (!dragOrigin) return;
     dragOrigin = null;
     if (!dragMoved) return;
 
-    const w = pipWidth.value;
-    const center = pipX.value + w / 2;
-    const goLeft = center < screenW.value / 2;
-    pipX.value = goLeft ? 8 : Math.max(8, screenW.value - w - 8);
+    if (!pipMini.value) {
+        const w = pipWidth.value;
+        const center = pipX.value + w / 2;
+        const goLeft = center < screenW.value / 2;
+        pipX.value = goLeft ? 8 : Math.max(8, screenW.value - w - 8);
+    }
 
-    // 夹一次：缩小态吸附后高度变化可能越界
+    // 夹一次：形态切换后高度变化可能越界
     const next = clampPip(pipX.value, pipY.value);
     pipX.value = next.x;
     pipY.value = next.y;
 }
 
-/** 点击（未拖动）时切换展开/缩小。 */
+/**
+ * 点击画面：切换收起 / 展开（参照微信）。
+ *
+ * 必须用 dragMoved 区分「点击」与「拖动」——
+ * 拖动结束后 WebView 仍会补发一次 click，
+ * 不判断的话每次拖完小窗都会自动收起。
+ */
 function onPipTap() {
     if (dragMoved) {
         dragMoved = false;
@@ -498,40 +550,6 @@ const statusText = computed(() => {
     if (callStatus.value === 'connecting') return '连接中…';
     if (callStatus.value === 'error') return '连接异常';
     return hasRemote.value ? '对方已接入' : '等待对方接入';
-});
-
-/**
- * 收起态的文案。
- *
- * 胶囊宽度只有 84px，塞不下「A 等 3 人」这类长文案，
- * 故只取第一个人的名字（多出来的用「+N」表示）。
- */
-const miniLabel = computed(() => {
-    const n = peerCount.value;
-    const first = peerNames.value[0];
-    if (n === 0) return '通话中';
-    if (n === 1) return first || '好友';
-    return `${first || '好友'} +${n - 1}`;
-});
-
-/**
- * 通话悬浮窗标题。
- *
- * 人数是**实时已连接的对端数**（谁进来加一、谁断开减一），
- * 并非预先知道会有几个人 —— 信令服务只下发「当前在线成员」。
- *
- * 名字一律取 peerNames（按连接建立顺序排列的名单）：
- * 早先用单个 peerName 变量会被每次新加入的人覆盖，
- * 多人时标题会变成「最后一个加入的人」，显示不稳定。
- */
-const pipTitle = computed(() => {
-    const n = peerCount.value;
-    const first = peerNames.value[0] || '对方';
-
-    if (n === 0) return '等待对方';
-    if (n === 1) return first;
-    // 「A 等 N 人」：N 是对端总人数（含 A），符合中文习惯
-    return `${first} 等 ${n} 人`;
 });
 
 /* ---------------- 片源 ---------------- */
@@ -666,31 +684,28 @@ function onLocalReady(_info: any) {
 /**
  * 切换收起 / 展开。
  *
- * 两种形态的停靠位置刻意不同：
- *   收起 —— 统一挪到右上角。它只是个名字胶囊，放角落最不干扰。
- *   展开 —— 按方向停靠（竖屏贴上方、横屏贴右侧），并保留当前左右侧，
- *           避免用户刚拖到左边、一展开又跳回右边。
+ * 收起后统一挪到右上角 —— 竖条只有 40px 宽，贴角最不干扰画面；
+ * 展开时沿用收起前所在的一侧，避免用户刚拖到左边、一展开又跳回右边。
  */
 function togglePipMini() {
-    // 记下展开前的水平位置，展开时尽量保持在同一侧
+    // 记下收起前的水平位置，展开时保持在同一侧
     const wasLeft = !pipAlignRight.value;
 
     pipMini.value = !pipMini.value;
 
     if (pipMini.value) {
-        // 收起：右上角
+        // 收起：右上角（clamp 会处理全屏时的上半屏限制）
         pipX.value = Math.max(8, screenW.value - pipWidth.value - 10);
-        pipY.value = isLandscapeScreen.value ? 10 : 76;
+        const next = clampPip(pipX.value, isLandscapeScreen.value ? 10 : 84);
+        pipX.value = next.x;
+        pipY.value = next.y;
         return;
     }
 
-    // 展开：按方向停靠，沿用之前所在的一侧
+    // 展开：沿用之前所在的一侧
     const w = pipWidth.value;
     pipX.value = wasLeft ? 8 : Math.max(8, screenW.value - w - 10);
-    const mid = Math.round((screenH.value - pipHeight.value) / 2);
-    const targetY = isLandscapeScreen.value ? mid : 76;
-
-    const next = clampPip(pipX.value, targetY);
+    const next = clampPip(pipX.value, pipY.value);
     pipX.value = next.x;
     pipY.value = next.y;
 
@@ -1071,66 +1086,32 @@ onUnload(() => {
         z-index: 99999;
         display: flex;
         flex-direction: column;
-        border-radius: 10rpx;
+        border-radius: 12px;
         overflow: hidden;
-        background-color: #000;
-        box-shadow: 0 8rpx 28rpx rgba(0, 0, 0, 0.72);
-        border: 1rpx solid rgba(255, 255, 255, 0.18);
+        background-color: #0b0d10;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.72);
+        border: 1px solid rgba(255, 255, 255, 0.16);
         /* 拖动跟手：禁掉浏览器默认手势与长按选中 */
         touch-action: none;
         user-select: none;
     }
 
     /*
-     * 收起态：整个窗口缩成一条名字胶囊。
-     * 视频与标题栏都用 display:none 藏起来 —— 注意**不能**用 v-if 卸载，
+     * 收起态：竖向小条。
+     * 参照腾讯会议 —— 收起后仍保留静音与挂断，
+     * 否则用户看不到画面时连自己是否静音都无从判断。
+     *
+     * 视频与按钮组用 display:none 藏起来 —— 注意**不能**用 v-if 卸载，
      * yh-rtc 是 renderjs 组件，卸载等于挂断通话。
      */
     &__pip--mini {
-        border-radius: 999rpx;
-        background-color: rgba(20, 23, 28, 0.92);
+        border-radius: 8px;
+        background-color: rgba(20, 23, 28, 0.94);
     }
 
     &__pip--mini .room__rtc,
-    &__pip--mini .room__pip-bar {
+    &__pip--mini .room__pip-acts {
         display: none;
-    }
-
-    /* 收起态默认隐藏，展开时才让位给视频 */
-    &__pip-mini {
-        display: none;
-    }
-
-    &__pip--mini .room__pip-mini {
-        display: flex;
-        flex: 1;
-        align-items: center;
-        gap: 6rpx;
-        padding: 0 10rpx;
-        height: 100%;
-    }
-
-    /* 通话状态点：接上了才发亮 */
-    &__pip-dot {
-        flex-shrink: 0;
-        width: 10rpx;
-        height: 10rpx;
-        border-radius: 50%;
-        background-color: rgba(255, 255, 255, 0.28);
-    }
-
-    &__pip-dot--live {
-        background-color: #4ade80;
-    }
-
-    &__pip-mini-name {
-        flex: 1;
-        min-width: 0;
-        font-size: 18rpx;
-        color: #c9ced6;
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
     }
 
     &__rtc {
@@ -1140,89 +1121,218 @@ onUnload(() => {
         background-color: #000;
     }
 
-    &__pip-bar {
+    /* ---------- 展开态：内嵌悬浮按钮组 ---------- */
+
+    /*
+     * 压在视频下缘，半透明渐变压底。
+     *
+     * 内嵌而非独立底部横条：全屏时横条会压住播放器进度条，
+     * 也遮挡画面下缘；内嵌在通话窗里则完全不干扰影片。
+     */
+    &__pip-acts {
         flex: none;
-        height: 44rpx;
-        padding: 0 10rpx;
+        height: 30px;
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        gap: 6rpx;
-        background-color: rgba(20, 23, 28, 0.94);
+        /* 两个按钮居中并留间距，不再撑到两侧边缘 */
+        justify-content: center;
+        gap: 26px;
+        background-color: #14171c;
     }
 
-    &__pip-name {
+    /* 单个圆形按钮：尺寸按小窗收紧 */
+    &__pact {
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: rgba(255, 255, 255, 0.12);
+    }
+
+    /* 关闭态：转成警示红，一眼可辨 */
+    &__pact--off {
+        background-color: rgba(217, 139, 133, 0.28);
+    }
+
+    /*
+     * ---------- CSS 绘制的图标 ----------
+     *
+     * 全部用伪元素画几何形状、颜色继承 currentColor ——
+     * 跨设备渲染完全一致，且状态色（正常白 / 关闭红）只需改 color。
+     * 不用 emoji 与图标字体：两者在 Android WebView 上都不可靠。
+     */
+    &__ico {
+        position: relative;
+        width: 12px;
+        height: 12px;
+        color: rgba(255, 255, 255, 0.92);
+    }
+
+    /* 关闭态：图标转红，与按钮底色呼应 */
+    &__ico.is-off {
+        color: #e88b82;
+    }
+
+    /* 麦克风：圆头 + 竖杆 + 底座 */
+    &__ico--mic::before {
+        content: '';
+        position: absolute;
+        left: 50%;
+        top: 0;
+        width: 5px;
+        height: 7px;
+        margin-left: -2.5px;
+        border-radius: 2.5px;
+        background-color: currentColor;
+    }
+
+    &__ico--mic::after {
+        content: '';
+        position: absolute;
+        left: 50%;
+        bottom: 0;
+        width: 9px;
+        height: 6px;
+        margin-left: -4.5px;
+        border: 1.4px solid currentColor;
+        border-top: 0;
+        border-radius: 0 0 6px 6px;
+    }
+
+    /* 静音：在麦克风上斜切一道，语义一眼可辨 */
+    &__ico--mic.is-off::after {
+        border: 0;
+        border-top: 1.4px solid currentColor;
+        border-radius: 0;
+        height: 0;
+        bottom: 3px;
+        width: 13px;
+        margin-left: -6.5px;
+        transform: rotate(-45deg);
+    }
+
+    /* 摄像头：机身 + 右侧镜头三角 */
+    &__ico--cam::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 2px;
+        width: 8px;
+        height: 8px;
+        border-radius: 1.5px;
+        background-color: currentColor;
+    }
+
+    &__ico--cam::after {
+        content: '';
+        position: absolute;
+        right: 0;
+        top: 4px;
+        width: 0;
+        height: 0;
+        border-top: 4px solid transparent;
+        border-bottom: 4px solid transparent;
+        border-right: 4px solid currentColor;
+        transform: rotate(180deg);
+    }
+
+    /* 摄像头关闭：机身留空，只余描边 */
+    &__ico--cam.is-off::before {
+        background-color: transparent;
+        border: 1.4px solid currentColor;
+    }
+
+    &__ico--cam.is-off::after {
+        border-right-color: currentColor;
+        opacity: 0.5;
+    }
+
+    /* 挂断：话筒横置（听筒形），红底上白图标 */
+    &__ico--hangup::before {
+        content: '';
+        position: absolute;
+        left: 1px;
+        top: 5px;
+        width: 10px;
+        height: 3.5px;
+        border-radius: 2px;
+        background-color: currentColor;
+    }
+
+    &__ico--hangup::after {
+        content: '';
+        position: absolute;
+        left: 3px;
+        top: 2px;
+        width: 6px;
+        height: 6px;
+        border: 1.4px solid currentColor;
+        border-radius: 50%;
+        border-color: currentColor transparent transparent transparent;
+    }
+
+    /*
+     * 收起态按钮更小，图标等比缩放。
+     * 用 transform 缩放而不是改尺寸：几何比例保持一致，不必重画。
+     */
+    &__mini-act &__ico {
+        transform: scale(0.92);
+    }
+
+    /* ---------- 收起态：竖向小条，两个图标 ---------- */
+
+    &__mini {
+        display: none;
+    }
+
+    /*
+     * 上下分布：上=麦克风、下=挂断。
+     * gap 保证两键之间留出空隙，避免误触到相邻按钮。
+     */
+    &__pip--mini .room__mini {
+        display: flex;
         flex: 1;
-        min-width: 0;
-        font-size: 18rpx;
-        color: #c9ced6;
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 4px 0;
     }
 
-    /* 「收起」提示：点击窗口任意处都生效，这里只是个视觉提示 */
-    &__pip-mini-text {
-        flex-shrink: 0;
-        font-size: 18rpx;
-        color: #f0a63c;
+    &__mini-act {
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: rgba(255, 255, 255, 0.12);
+    }
+
+    &__mini-act--off {
+        background-color: rgba(217, 139, 133, 0.28);
+    }
+
+    /* 挂断：红底，与其他键明确区分 */
+    &__mini-act--hangup {
+        background-color: #b4534b;
     }
 
     /* ---------- 通话控制条 ---------- */
 
+    /*
+     * 通话控制条（仅非全屏时渲染）。
+     *
+     * 全屏时按钮已内嵌在通话悬浮窗内，不再需要这条横条 —— 它既与悬浮窗
+     * 内的按钮重复，又会压住播放器的进度条。
+     */
     &__call-bar {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
         padding: 20rpx 24rpx 4rpx;
-    }
-
-    /*
-     * 全屏态：控制条升为浮层，压在播放器之上。
-     *
-     * 做成**居中的胶囊条**而不是整宽色带：
-     * 播放器全屏时底部本来就有一条进度条，整宽浮层会把它整条盖住，
-     * 用户看不到播放进度。胶囊只占中间一小段，两侧留空给进度条。
-     * 位置略微上移，进一步避开进度条区域。
-     */
-    &__call-bar--float {
-        position: fixed;
-        left: 50%;
-        transform: translateX(-50%);
-        bottom: calc(44px + env(safe-area-inset-bottom));
-        z-index: 99998;
-        flex-wrap: nowrap;
-        justify-content: center;
-        /* 尺寸全用 px：横屏下 rpx 会被放大（见下方按钮注释） */
-        gap: 6px;
-        padding: 5px 8px;
-        border-radius: 999px;
-        background-color: rgba(11, 13, 16, 0.78);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
-        /* 宽度由内容决定，不铺满 */
-        width: auto;
-        right: auto;
-    }
-
-    /*
-     * 浮层态：**尺寸一律用 px，不用 rpx**。
-     *
-     * 横屏下 rpx 的基准是屏幕「长边」（约 780px），1rpx ≈ 1.04px，
-     * 同一个 56rpx 会比竖屏下大一圈；而这个浮层只在全屏（横屏）时出现，
-     * 于是必然偏大。改用 px 后尺寸与屏幕方向无关，稳定可控。
-     *
-     * 同时整体收紧：横屏的可视高度本来就矮，浮层不能占太多。
-     */
-    &__call-bar--float .room__bar-btn {
-        margin: 0;
-        height: 26px;
-        padding: 0 11px;
-        border-radius: 13px;
-    }
-
-    &__call-bar--float .room__bar-text {
-        font-size: 12px;
     }
 
     &__bar-btn {
