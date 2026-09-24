@@ -65,7 +65,14 @@ export default {
          */
         collections: { type: Array, default: () => [] },
         /** 当前集下标，用于面板高亮。 */
-        currentIndex: { type: Number, default: 0 }
+        currentIndex: { type: Number, default: 0 },
+        /**
+         * 全屏顶部栏显示的标题（如「XXX 第 3 集」）。
+         *
+         * 为空时整条顶部栏仍会渲染（返回键必须有），只是不显示文字。
+         * 标题过长会自动横向滚动（见 .vp-title 的动画）。
+         */
+        title: { type: String, default: '' }
     },
     data() {
         return {
@@ -116,7 +123,9 @@ export default {
                  * 数量可达数百集，整对象同步会把属性桥压垮。
                  */
                 episodes: this.collections.map(c => ({ id: c.id, name: c.name })),
-                currentIndex: this.currentIndex
+                currentIndex: this.currentIndex,
+                /* 顶部栏标题：随集数变化，同步到渲染层 */
+                title: this.title
             };
         }
     },
@@ -315,6 +324,14 @@ const GESTURE_THRESHOLD = 8;
 const GESTURE_SPAN_RATIO = 0.62;
 
 /**
+ * 全屏下右滑退出全屏的最小横向位移（px）。
+ *
+ * 取 90：太短会在调节亮度/音量时被误判（手指横向抖动），
+ * 太长则要划很大一段才生效，手感迟钝。
+ */
+const SWIPE_OUT_THRESHOLD = 90;
+
+/**
  * 网速的滑动窗口（秒）。
  *
  * 分片是成块到达的（几百 KB 一次性完成），窗口太短会看到数字脉冲式跳动；
@@ -447,6 +464,74 @@ const CSS_TEXT = `
 .vp-i-pause:after { right: 0; }
 
 .vp-bottom { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 14px 11px; }
+
+/* ---------------- 顶部栏（仅全屏） ---------------- */
+
+/*
+ * 与 vp-bottom 同处 vp-layer，因此显隐完全同步 ——
+ * 点画面一起出现、自动延时一起收起，行为与进度条一致。
+ *
+ * 默认 display:none：非全屏时顶部不需要返回键与剧名，
+ * 画面本来就小，再加一条会挤压可视面积。
+ */
+.vp-top { position: absolute; left: 0; right: 0; top: 0; display: none;
+    align-items: center; padding: 0 14px; height: 52px; }
+.vp-box.is-fs .vp-top { display: flex; }
+.vp-box.is-fs.is-portrait-fs .vp-top { height: 44px; }
+
+/* 返回键：圆形底 + CSS 箭头，触控区放大到 40×40 */
+.vp-back { flex-shrink: 0; width: 40px; height: 40px; margin-right: 10px;
+    border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.32); }
+.vp-back:active { background: rgba(255,255,255,.2); }
+.vp-i-back { width: 11px; height: 11px; margin-left: 4px;
+    border-left: 2px solid rgba(255,255,255,.94);
+    border-bottom: 2px solid rgba(255,255,255,.94);
+    border-radius: 1px; transform: rotate(45deg); }
+
+/*
+ * 标题容器：定宽 + 裁剪。
+ * min-width:0 必须加 —— flex 子项默认 min-width:auto，
+ * 长标题会把容器撑开、把返回键挤出屏幕。
+ */
+.vp-title-wrap { flex: 1; min-width: 0; overflow: hidden; position: relative; }
+
+/*
+ * 标题本体。
+ *
+ * 用 width: max-content 而不是 inline-block：让元素宽度等于
+ * 文字的自然宽度（不被容器压缩），这样 JS 读 scrollWidth 才能
+ * 拿到真实文字宽度、据此判断是否需要滚动。
+ * 若用 inline-block + 容器约束，scrollWidth 会等于容器宽度，
+ * 判定「是否溢出」就永远不成立 —— 短文字也会被误判成要滚。
+ *
+ * 默认静止：短标题固定显示在左侧，不做任何动画。
+ */
+.vp-title { display: block; width: max-content; white-space: nowrap;
+    font-size: 14px; color: rgba(255,255,255,.94);
+    text-shadow: 0 1px 3px rgba(0,0,0,.7); }
+.vp-box.is-fs.is-portrait-fs .vp-title { font-size: 13px; }
+
+/*
+ * 仅当文字超长（JS 判定后加 is-scrolling）才滚动。
+ *
+ * 无缝滚动的做法：用 ::after 复制一份接在后面，整体左移 ——
+ * 单份文字滚到末尾会露出空白，两份首尾相接才连贯。
+ * 位移量由 JS 按实测文字宽度写入 --vp-title-shift。
+ */
+.vp-title-wrap.is-scrolling .vp-title {
+    animation: vp-title-scroll 14s linear infinite;
+}
+.vp-title-wrap.is-scrolling .vp-title::after {
+    content: attr(data-text);
+    display: inline-block;
+    /* 两份之间留出间隔，避免接缝处连成一串 */
+    margin-left: 40px;
+}
+@keyframes vp-title-scroll {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(calc(-1 * var(--vp-title-shift, 100%))); }
+}
 
 /* 全屏（横屏）：控件放大，便于点按 */
 .vp-box.is-fs .vp-bottom { padding: 0 28px 20px; }
@@ -720,6 +805,13 @@ export default {
             statEl: null,
             statNetEl: null,
             statBufEl: null,
+            /** 全屏顶部栏（返回键 + 剧名） */
+            topEl: null,
+            backEl: null,
+            titleEl: null,
+            titleWrapEl: null,
+            /** 当前标题文本（用于去重，避免重复触发动画） */
+            titleText: '',
             /** 倍速面板 */
             ratePanelEl: null,
             rateListEl: null,
@@ -944,6 +1036,9 @@ export default {
 
             // 面板开着时实时刷新，否则等下次打开时重建
             if (this.epPanelOn && (listChanged || idxChanged)) this.buildEpisodePanel();
+
+            // 顶部栏标题
+            this.applyTitle(this.props.title);
 
             if (!el) return;
             el.muted = !!this.props.muted;
@@ -1503,6 +1598,86 @@ export default {
         },
 
         /**
+         * 更新顶部栏标题。
+         *
+         * 只在**文字确实超出容器**时才滚动，短标题固定不动。
+         *
+         * 测量要点（这两点写错会导致短文字也被判为溢出、一起滚起来）：
+         *   1. 必须量「文字的自然宽度」与「容器可用宽度」两个不同来源。
+         *      若拿 .vp-title 的 scrollWidth 与它自己的 clientWidth 比，
+         *      两者永远相等（inline-block 宽度由内容决定），判定必然失效。
+         *   2. 必须等顶部栏**可见**后再量。全屏前它是 display:none，
+         *      clientWidth 为 0，任何文字都会被算成溢出。
+         */
+        applyTitle(text) {
+            const el = this.titleEl;
+            const wrap = this.titleWrapEl;
+            if (!el || !wrap) return;
+
+            const next = String(text || '');
+            if (this.titleText === next) return;
+            this.titleText = next;
+
+            el.textContent = next;
+            /*
+             * 同步写一份到 data-text。
+             * 滚动的第二份文字由 ::after 的 content: attr(data-text) 生成，
+             * 不写这个属性第二份就是空的，滚过去会露出一段空白。
+             */
+            el.setAttribute('data-text', next);
+            this.resetTitleScroll();
+            this.measureTitle();
+
+            if (!next) return;
+        },
+
+        /** 复位滚动状态（去掉动画与位移，回到静止）。 */
+        resetTitleScroll() {
+            if (this.titleWrapEl) this.titleWrapEl.classList.remove('is-scrolling');
+            if (this.titleEl) this.titleEl.style.removeProperty('--vp-title-shift');
+        },
+
+        /**
+         * 测量标题是否需要滚动，并按需启用。
+         *
+         * 需要重复调用：全屏切换、横竖屏切换都会改变可用宽度，
+         * 同一个标题在竖屏够宽、横屏可能就不够了（反之亦然）。
+         */
+        measureTitle() {
+            const el = this.titleEl;
+            const wrap = this.titleWrapEl;
+            if (!el || !wrap || !el.textContent) return;
+
+            /*
+             * 顶部栏不可见时量不到有效宽度（clientWidth 为 0），
+             * 此时直接跳过 —— 等它显示后由 enterFullscreen 再量一次。
+             */
+            const avail = wrap.clientWidth;
+            if (avail <= 0) return;
+
+            /*
+             * 文字自然宽度：临时让它脱离容器约束来量。
+             * 用 white-space:nowrap + position:absolute 的测量技巧
+             * 成本较高，这里改用 scrollWidth —— 但前提是 .vp-title
+             * 不设 width，其 scrollWidth 即内容宽度（见样式注释）。
+             */
+            const natural = el.scrollWidth;
+            // 留 8px 容差，避免「刚好贴着边缘」也被判成溢出
+            if (natural <= avail + 8) {
+                this.resetTitleScroll();
+                return;
+            }
+
+            /*
+             * 位移 = 文字宽度 + 间距。
+             * 要完整滚过一遍才能接上第二份，只滚「溢出的那部分」
+             * 会在中途露出空白。
+             */
+            el.style.setProperty('--vp-title-shift', `${natural + 40}px`);
+            wrap.classList.add('is-scrolling');
+        },
+
+        /**
          * 网速刷新定时器。
          *
          * 每 500ms 按滑动窗口重算一次速率并刷新信息行。
@@ -1875,6 +2050,17 @@ export default {
             layer.innerHTML =
                 '<div class="vp-scrim-top"></div>' +
                 '<div class="vp-scrim-bottom"></div>' +
+                /*
+                 * 顶部栏：返回键 + 剧名。
+                 *
+                 * 与底部控制条同处 vp-layer，因此显隐完全同步 ——
+                 * 点画面唤出、自动延时收起，行为与进度条一致（用户要求）。
+                 * 返回键只退出全屏，不离开页面（离开由页面自己的返回键负责）。
+                 */
+                '<div class="vp-top">' +
+                '<div class="vp-back" title="退出全屏"><div class="vp-i-back"></div></div>' +
+                '<div class="vp-title-wrap"><span class="vp-title"></span></div>' +
+                '</div>' +
                 '<div class="vp-center"><div class="vp-i-play"></div></div>' +
                 '<div class="vp-bottom">' +
                 '<div class="vp-progress"><div class="vp-track">' +
@@ -1912,6 +2098,10 @@ export default {
             this.statEl = layer.querySelector('.vp-stat');
             this.statNetEl = layer.querySelector('.vp-stat-net');
             this.statBufEl = layer.querySelector('.vp-stat-buf');
+            this.topEl = layer.querySelector('.vp-top');
+            this.backEl = layer.querySelector('.vp-back');
+            this.titleEl = layer.querySelector('.vp-title');
+            this.titleWrapEl = layer.querySelector('.vp-title-wrap');
 
             // 手势 HUD 独立挂在容器上，控件隐藏时也能显示
             const hud = document.createElement('div');
@@ -2234,6 +2424,20 @@ export default {
             }
 
             /*
+             * 顶部栏返回键（仅全屏时可见）。
+             *
+             * 只退出全屏，**不离开页面** —— 这是播放器内部的全屏态，
+             * 用户按返回的本意几乎总是「退出全屏看下面的信息」。
+             * 真正离开页面由页面自己的返回键 / onBackPress 负责。
+             */
+            if (this.backEl) {
+                this.backEl.addEventListener('click', e => {
+                    e.stopPropagation();
+                    this.exitFullscreen();
+                });
+            }
+
+            /*
              * 选集入口（仅全屏时可见）。
              *
              * 直接开渲染层内建面板，不再 emit 回逻辑层让页面弹抽屉 ——
@@ -2388,7 +2592,9 @@ export default {
                     startY: t.clientY,
                     side: t.clientX < w / 2 ? 'brightness' : 'volume',
                     base: 0,
-                    active: false
+                    active: false,
+                    // 全屏时记录「退出全屏」手势的判定状态
+                    swipeOut: false
                 };
             };
 
@@ -2400,6 +2606,28 @@ export default {
 
                 const dx = t.clientX - g.startX;
                 const dy = t.clientY - g.startY;
+
+                /*
+                 * 全屏下的「右滑退出全屏」。
+                 *
+                 * 与竖屏滑动手势的区别：全屏时用户最想做的事就是退出，
+                 * 而返回键在横屏下不好按（部分机型还会被系统手势占用），
+                 * 右滑是各家播放器的通行做法。
+                 *
+                 * 判定条件（三者同时满足才算）：
+                 *   1. 横向位移占主导，避免与亮度/音量手势打架
+                 *   2. 方向是向右（dx > 0）
+                 *   3. 位移超过阈值，避免轻触误退出
+                 */
+                if (this.landscapeOn && !g.active && !g.swipeOut) {
+                    if (Math.abs(dx) > SWIPE_OUT_THRESHOLD && Math.abs(dx) > Math.abs(dy) * 1.5) {
+                        g.swipeOut = true;
+                        if (e.cancelable) e.preventDefault();
+                        // 只退出全屏（回到竖屏），不离开页面
+                        this.exitFullscreen();
+                        return;
+                    }
+                }
 
                 if (!g.active) {
                     if (Math.abs(dy) < GESTURE_THRESHOLD) return;
@@ -2425,7 +2653,18 @@ export default {
             const onEnd = () => {
                 const g = this.gesture;
                 this.gesture = null;
-                if (!g || !g.active) return;
+                // 退出全屏的手势不做后续处理（HUD、点击屏蔽都不需要）
+                if (!g || g.swipeOut) {
+                    if (g && g.swipeOut) {
+                        // 仍要屏蔽手势后补发的 click，否则会误切控件显隐
+                        this.suppressClick = true;
+                        setTimeout(() => {
+                            this.suppressClick = false;
+                        }, 320);
+                    }
+                    return;
+                }
+                if (!g.active) return;
                 this.hideHudSoon();
                 // 手势期间暂停了自动隐藏，结束后恢复计时
                 this.scheduleHide();
@@ -2705,6 +2944,12 @@ export default {
             this.boxEl && this.boxEl.classList.toggle('is-portrait-fs', !this.landscapeLayout);
             // 横竖切换后视口尺寸变了，重算一次进度条等依赖布局的尺寸
             this.$nextTick(() => this.syncTime());
+            /*
+             * 可用宽度也随方向变化（横屏更宽）。
+             * 同一个标题在竖屏可能放不下、横屏却够 —— 反之亦然，
+             * 因此每次切换方向都要重新判定是否需要滚动。
+             */
+            this.$nextTick(() => this.measureTitle());
             this.emit('orientationchange', this.landscapeLayout ? 'landscape' : 'portrait');
         },
 
@@ -2744,6 +2989,16 @@ export default {
             if (this.fsEl) this.fsEl.classList.add('is-exit');
             this.showLayer();
             this.scheduleHide();
+
+            /*
+             * 进入全屏后重新测量标题。
+             *
+             * 顶部栏非全屏时是 display:none，之前量到的可用宽度是 0，
+             * 无法判断标题是否需要滚动（只能等显示后补测）。
+             * 全屏切换会改变可用宽度，因此这里必须再量一次。
+             */
+            this.$nextTick(() => this.measureTitle());
+
             this.emit('landscapechange', true);
         },
 

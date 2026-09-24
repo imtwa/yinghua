@@ -1,6 +1,11 @@
 <template>
     <view class="search">
-        <yh-nav title="搜索" />
+        <yh-nav :title="pickMode ? '选择影片' : '搜索'" />
+
+        <!-- 选片模式下的说明：告诉用户点了会发生什么 -->
+        <view v-if="pickMode" class="search__hint">
+            <text class="search__hint-text">搜索并点击影片，房间内所有人会一起切过去</text>
+        </view>
 
         <view class="search__bar">
             <input
@@ -40,7 +45,7 @@
                     :key="vod.id"
                     class="search__grid-item"
                     :vod="vod"
-                    @click="goDetail" />
+                    @click="onPick(vod)" />
             </view>
             <yh-empty v-else :text="`没有找到「${lastKeyword}」相关影片`" />
         </view>
@@ -51,6 +56,11 @@
 /**
  * 搜索页。
  *
+ * 两种用途：
+ *   · 普通搜索 —— 点结果进详情页
+ *   · 选片模式（mode=pick）—— 房间内房主换片时打开，
+ *     点结果即选中并返回房间，由房间页负责切换与广播。
+ *
  * 数据源说明：服务端 `/api/search/result` 已失效（恒返回空数组），
  * 故改用 `/api/search/screen` 拉取分页数据 + 本地关键词匹配。
  * 详见 services/video.ts 的 searchVod。
@@ -60,6 +70,7 @@ import { ref } from 'vue';
 import { onLoad } from '@dcloudio/uni-app';
 import type { Vod } from '@/api/types';
 import { getHotSearch, searchVod } from '@/services/video';
+import { savePendingPick } from '@/utils/room-sync';
 
 const keyword = ref('');
 const lastKeyword = ref('');
@@ -67,6 +78,8 @@ const hotWords = ref<Array<{ name: string; vodId?: number }>>([]);
 const results = ref<Vod[]>([]);
 const searched = ref(false);
 const searching = ref(false);
+/** 是否处于「为房间选片」模式 */
+const pickMode = ref(false);
 
 async function loadHot() {
     try {
@@ -102,11 +115,30 @@ function searchWord(w: string) {
     doSearch();
 }
 
-function goDetail(vod: Vod) {
-    uni.navigateTo({ url: `/pages/detail/detail?id=${vod.id}` });
+/**
+ * 点击结果。
+ *
+ * 选片模式：把选中项写进存储并返回，房间页在 onShow 里消费。
+ * 这里**不直接改房间状态** —— 房间页还在栈里，由它统一处理
+ * 切集与广播，避免两个页面同时操作播放器。
+ */
+function onPick(vod: Vod) {
+    if (!pickMode.value) {
+        uni.navigateTo({ url: `/pages/detail/detail?id=${vod.id}` });
+        return;
+    }
+
+    savePendingPick({ vodId: vod.id, vodName: vod.vod_name, vodPic: vod.vod_pic });
+    uni.navigateBack({
+        fail: () => {
+            // 极端情况下栈里没有上一页，退回房间页兜底
+            uni.redirectTo({ url: '/pages/room/room' });
+        }
+    });
 }
 
-onLoad(() => {
+onLoad(options => {
+    pickMode.value = options?.mode === 'pick';
     loadHot();
 });
 </script>
@@ -118,6 +150,20 @@ onLoad(() => {
     background-color: #0b0d10;
     /* 底部安全区：搜索结果最后一行会被 iPhone 小黑条压住 */
     padding-bottom: env(safe-area-inset-bottom);
+
+    /* 选片模式提示条：说明「点一下会发生什么」 */
+    &__hint {
+        margin: 0 24rpx 4rpx;
+        padding: 16rpx 24rpx;
+        border-radius: 12rpx;
+        background-color: rgba(240, 166, 60, 0.12);
+    }
+
+    &__hint-text {
+        font-size: 24rpx;
+        line-height: 1.6;
+        color: #f0a63c;
+    }
 
     &__bar {
         display: flex;

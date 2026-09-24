@@ -157,27 +157,53 @@ async function loadHome() {
         loading.value = false;
 
         /*
-         * 分类栏目**串行**加载。
+         * 分类栏目**并行**加载。
          *
-         * 每个栏目内部已是对 8 个子类的分批并发（见 service 的 fetchGrouped），
-         * 若 4 个栏目再并行，瞬时请求数会触发源站限流 ——
-         * 实测会导致整批失败、栏目变空。
-         * 串行虽慢一点，但配合增量渲染，用户先看到「最新」，
-         * 后续栏目逐个出现，观感反而更稳。
+         * 早先是 `for + await` 串行：4 个栏目逐个等，
+         * 每个栏目内部还要聚合 8 个子类，总耗时是各栏目之和 ——
+         * 这正是「首页加载很慢」的根因。
+         *
+         * 现在一次性全部提交，且**谁先完成谁先上屏**：
+         *   · 并发上限由 service 层的全局闸门统一控制（恒定 6），
+         *     上层怎么并行都不会打爆源站 —— 这是能安全并行的前提。
+         *   · 完成一个就立刻重建列表，用户不必等最慢的栏目。
          */
-        for (const sec of HOME_SECTIONS) {
-            sectionTip.value = `正在加载「${sec.name}」`;
+        sectionTip.value = '正在加载栏目';
+
+        /*
+         * 已加载的栏目（分类名 → 影片列表）。
+         *
+         * 用「映射 + 按固定顺序重建」而不是「算下标插入」：
+         * 下标插入依赖「前面的栏目已就位」，而并行完成顺序是随机的 ——
+         * 若「综艺」最先返回，算出的位置会越界、被夹到末尾，
+         * 结果它排到了「短剧」前面。用映射重建则与到达顺序完全无关。
+         */
+        const loaded = new Map<string, Vod[]>();
+
+        /** 按 HOME_SECTIONS 的配置顺序重建列表，「最新」恒在首位。 */
+        const rebuild = () => {
+            const next: HomeSection[] = sections.value.filter(s => s.isLatest);
+            for (const cfg of HOME_SECTIONS) {
+                const list = loaded.get(cfg.name);
+                if (list && list.length) next.push({ name: cfg.name, list });
+            }
+            sections.value = next;
+        };
+
+        const tasks = HOME_SECTIONS.map(async sec => {
             try {
                 const mods = await getChannelInfo(sec.name, 1, sec.alias || []);
                 const list = flatten(mods);
-                if (list.length) {
-                    sections.value = [...sections.value, { name: sec.name, list }];
-                }
+                if (!list.length) return;
+                loaded.set(sec.name, list);
+                rebuild();
             } catch (e) {
                 // 单个栏目失败不影响其它栏目
                 console.warn('[home] 栏目加载失败', sec.name, e);
             }
-        }
+        });
+
+        await Promise.all(tasks);
     } finally {
         sectionTip.value = '';
         loading.value = false;

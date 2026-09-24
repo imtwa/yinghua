@@ -46,8 +46,57 @@ interface CmsResponse {
     class?: any[];
 }
 
-/** 向指定源发 GET 请求。 */
-function fetchSource(source: ContentSource, params: Record<string, any>): Promise<CmsResponse> {
+/**
+ * 全局并发闸门。
+ *
+ * 为什么要有：源站对短时间密集请求会临时拒绝（实测同一批请求
+ * 时而全成功、时而全失败，属限流）。因此必须限制「同时在飞的请求数」。
+ *
+ * 为什么放在最底层而不是各调用点：首页要并行拉多个栏目，
+ * 每个栏目内部又并发多个子类。若只在栏目内限流，
+ * 多栏目并行时总并发会相乘（实测到 24 就会整批失败）。
+ * 把闸门放在 fetchSource 这一层，任何调用路径都共用一个池，
+ * 无论上层怎么并行，实际并发恒定。
+ */
+const MAX_CONCURRENT = 6;
+
+/** 当前在飞请求数 */
+let inflight = 0;
+/** 等待队列（FIFO，保证先到先发） */
+const waitQueue: Array<() => void> = [];
+
+/** 申请一个并发额度（满了就排队等待）。 */
+function acquireSlot(): Promise<void> {
+    if (inflight < MAX_CONCURRENT) {
+        inflight += 1;
+        return Promise.resolve();
+    }
+    return new Promise<void>(resolve => waitQueue.push(resolve));
+}
+
+/** 归还额度并唤醒队首等待者。 */
+function releaseSlot() {
+    const next = waitQueue.shift();
+    if (next) {
+        // 额度直接转交，不改 inflight —— 避免「先减后加」的空窗
+        next();
+        return;
+    }
+    inflight -= 1;
+}
+
+/** 向指定源发 GET 请求（受全局并发闸门约束）。 */
+async function fetchSource(source: ContentSource, params: Record<string, any>): Promise<CmsResponse> {
+    await acquireSlot();
+    try {
+        return await doFetchSource(source, params);
+    } finally {
+        releaseSlot();
+    }
+}
+
+/** 实际发起请求（调用前须已取得并发额度）。 */
+function doFetchSource(source: ContentSource, params: Record<string, any>): Promise<CmsResponse> {
     const query = Object.entries(params)
         .filter(([, v]) => v !== undefined && v !== null && v !== '')
         .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
@@ -386,10 +435,10 @@ function delay(ms: number): Promise<void> {
  *   只返回 7 条 2023 年的老剧，而它的子类国产剧/韩剧/日剧/泰剧
  *   每天都在更新（首条均为当天）。不查子类，首页栏目只会是老内容。
  *
- * 为什么要有并发上限与重试：
- *   源站对短时间密集请求会临时拒绝（实测同一批请求时而全成功、
- *   时而全失败，属限流而非稳定并发上限）。若不重试，聚合结果会
- *   静默缺内容 —— 曾观察到「综艺」栏目整体变空。
+ * 并发控制交给底层的全局闸门（见 fetchSource）——
+ * 这里只需一次性把全部子类请求提交出去，闸门会按 6 并发自动排队。
+ * 早先在这里再做「分批 + 批间 delay」，与全局闸门叠加后反而
+ * 让总耗时成倍增加（每批都要等一个 120ms 的间隔）。
  *
  * @param source 已选定的源
  * @param ids    参与聚合的分类 id（父类 + 子类）
@@ -404,29 +453,20 @@ async function fetchGrouped(
     const seen = new Set<number>();
     let total = 0;
 
-    /*
-     * 分批并发（每批 CONCURRENCY 个），批间留少量间隔。
-     * 全量并发几十个请求会触发限流，导致部分子类整批失败。
-     */
-    const CONCURRENCY = 6;
-    for (let i = 0; i < ids.length; i += CONCURRENCY) {
-        const batch = ids.slice(i, i + CONCURRENCY);
-        const settled = await Promise.all(
-            batch.map(id => fetchSourceRetry(source, { ac: 'detail', t: id, pg: page }).catch(() => null))
-        );
+    // 全部子类一次提交；并发由底层闸门限流，失败的重试也在 fetchSourceRetry 内
+    const settled = await Promise.all(
+        ids.map(id => fetchSourceRetry(source, { ac: 'detail', t: id, pg: page }).catch(() => null))
+    );
 
-        for (const r of settled) {
-            if (!r || !r.list) continue;
-            total += Number(r.total) || 0;
-            for (const v of r.list) {
-                const vid = Number(v.vod_id) || 0;
-                if (vid && seen.has(vid)) continue;
-                if (vid) seen.add(vid);
-                merged.push(v);
-            }
+    for (const r of settled) {
+        if (!r || !r.list) continue;
+        total += Number(r.total) || 0;
+        for (const v of r.list) {
+            const vid = Number(v.vod_id) || 0;
+            if (vid && seen.has(vid)) continue;
+            if (vid) seen.add(vid);
+            merged.push(v);
         }
-
-        if (i + CONCURRENCY < ids.length) await delay(120);
     }
 
     return { list: sortByTimeDesc(merged), total };

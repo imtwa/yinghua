@@ -20,6 +20,7 @@
                     :offline="offlineInfo"
                     :collections="collections"
                     :current-index="currentIndex"
+                    :title="playerTitle"
                     @timeupdate="onTimeUpdate"
                     @landscapechange="onLandscapeChange"
                     @orientationchange="onOrientationChange"
@@ -315,6 +316,21 @@ const vodId = ref(0);
 
 /** 导航栏标题：优先剧名，未加载出来时退化为分集标题。 */
 const navTitle = computed(() => vodName.value || episodeTitle.value || '播放');
+
+/**
+ * 全屏顶部栏标题：片名 + 集数（如「庆余年 第 3 集」）。
+ *
+ * 全屏时画面铺满、看不到下方的片名与集数，顶部栏要把这两项
+ * 一并给出，否则用户不知道自己在看第几集。
+ */
+const playerTitle = computed(() => {
+    const name = vodName.value || '';
+    const ep = episodeTitle.value || '';
+    if (!name) return ep;
+    // 分集标题常常本身就含片名，重复时只留分集标题
+    if (ep && ep.includes(name)) return ep;
+    return ep ? `${name} ${ep}` : name;
+});
 
 /** 解析播放地址。 */
 async function resolve() {

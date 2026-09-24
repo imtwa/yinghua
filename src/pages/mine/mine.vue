@@ -64,21 +64,21 @@
                 <text class="mine__item-text">观看历史</text>
                 <view class="mine__item-right">
                     <text class="mine__item-count">{{ userStore.historyCount }}</text>
-                    <text class="mine__item-arrow">›</text>
+                    <view class="mine__arrow" />
                 </view>
             </view>
             <view class="mine__item tap-row" @click="goFavorite">
                 <text class="mine__item-text">我的收藏</text>
                 <view class="mine__item-right">
                     <text class="mine__item-count">{{ userStore.favoriteCount }}</text>
-                    <text class="mine__item-arrow">›</text>
+                    <view class="mine__arrow" />
                 </view>
             </view>
             <view class="mine__item tap-row" @click="goCache">
                 <text class="mine__item-text">离线缓存</text>
                 <view class="mine__item-right">
                     <text class="mine__item-count">{{ cacheText }}</text>
-                    <text class="mine__item-arrow">›</text>
+                    <view class="mine__arrow" />
                 </view>
             </view>
         </view>
@@ -265,18 +265,23 @@ function goCache() {
     &__card {
         display: flex;
         align-items: center;
-        padding: 40rpx 24rpx;
+        padding: 40rpx 28rpx 32rpx;
     }
 
+    /*
+     * 头像：圆形渐变底 + 细描边。
+     * 纯色方块在纯黑背景上像一个洞，渐变让它有「徽章」的质感。
+     */
     &__avatar {
         width: 120rpx;
         height: 120rpx;
         border-radius: 60rpx;
-        background-color: #1d2128;
         display: flex;
         align-items: center;
         justify-content: center;
         flex-shrink: 0;
+        background-image: linear-gradient(135deg, rgba(240, 166, 60, 0.24), rgba(240, 166, 60, 0.06));
+        border: 1rpx solid rgba(240, 166, 60, 0.28);
     }
 
     &__avatar-text {
@@ -306,13 +311,14 @@ function goCache() {
         max-width: 360rpx;
     }
 
+    /* 「修改」做成小胶囊，比裸文字更像可点的入口 */
     &__edit {
         margin-left: 16rpx;
-        padding: 2rpx 16rpx;
+        padding: 4rpx 18rpx;
         font-size: 22rpx;
         color: #f0a63c;
-        border-radius: 20rpx;
-        background-color: #1d2128;
+        border-radius: 999rpx;
+        background-color: rgba(240, 166, 60, 0.14);
         flex-shrink: 0;
     }
 
@@ -325,12 +331,18 @@ function goCache() {
 
     /* ---------- 统计 ---------- */
 
+    /*
+     * 三张卡片（统计 / 一起看 / 列表）统一用同一套外观：
+     * 同圆角、同底色、同极淡描边。原先只有底色、无描边，
+     * 在纯黑背景上边界感很弱。
+     */
     &__stats {
         display: flex;
         margin: 0 24rpx;
         padding: 28rpx 0;
         border-radius: 16rpx;
         background-color: #14171c;
+        border: 1rpx solid rgba(255, 255, 255, 0.05);
     }
 
     &__stat {
@@ -338,6 +350,11 @@ function goCache() {
         display: flex;
         flex-direction: column;
         align-items: center;
+    }
+
+    /* 中间加一条竖分隔，三块数字之间才有层次 */
+    &__stat + .mine__stat {
+        border-left: 1rpx solid rgba(255, 255, 255, 0.06);
     }
 
     &__stat-num {
@@ -362,6 +379,7 @@ function goCache() {
         padding: 28rpx;
         border-radius: 16rpx;
         background-color: #14171c;
+        border: 1rpx solid rgba(255, 255, 255, 0.05);
     }
 
     &__join-head {
@@ -389,13 +407,19 @@ function goCache() {
 
     &__join-input {
         flex: 1;
+        min-width: 0;
         height: 76rpx;
         padding: 0 24rpx;
         border-radius: 38rpx;
         background-color: #1d2128;
         color: #e8eaed;
         font-size: 30rpx;
-        letter-spacing: 6rpx;
+        /*
+         * 字距收敛到 3rpx：房间号是 6 位大写字母数字，
+         * 略宽的字距便于逐位核对；原先 6rpx 会让字符显得散开。
+         */
+        letter-spacing: 3rpx;
+        font-variant-numeric: tabular-nums;
     }
 
     &__join-placeholder {
@@ -441,17 +465,28 @@ function goCache() {
     }
 
     &__list {
-        margin-top: 24rpx;
+        /*
+         * 卡片化：与上方 __stats / __join 的圆角卡片风格统一。
+         * 原先是整块通栏无圆角，三张卡片里夹一块方块，显得割裂。
+         */
+        margin: 24rpx;
+        border-radius: 16rpx;
         background-color: #14171c;
+        border: 1rpx solid rgba(255, 255, 255, 0.05);
+        overflow: hidden;
     }
 
     &__item {
         height: 104rpx;
-        padding: 0 24rpx;
+        padding: 0 28rpx;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        border-bottom: 1rpx solid #1d2128;
+    }
+
+    /* 分隔线只画在中间，不顶到卡片边缘 —— 通栏线会让卡片显得像被切开 */
+    &__item + .mine__item {
+        border-top: 1rpx solid rgba(255, 255, 255, 0.06);
     }
 
     &__item-text {
@@ -467,26 +502,38 @@ function goCache() {
     &__item-count {
         font-size: 26rpx;
         color: #6b7280;
-        margin-right: 8rpx;
+        margin-right: 10rpx;
+        font-variant-numeric: tabular-nums;
     }
 
-    &__item-arrow {
-        font-size: 40rpx;
-        color: #3d434e;
+    /*
+     * 右向箭头：CSS 绘制而非「›」字符。
+     * 字符箭头各机型字体不同、基线会漂，旋转 45° 的边框则完全一致
+     * （导航栏的返回箭头用的是同一套做法）。
+     */
+    &__arrow {
+        flex-shrink: 0;
+        width: 14rpx;
+        height: 14rpx;
+        border-top: 3rpx solid #3d434e;
+        border-right: 3rpx solid #3d434e;
+        border-radius: 2rpx;
+        transform: rotate(45deg);
     }
 
     &__tip {
-        margin: 20rpx 24rpx 0;
+        margin: 0 28rpx;
     }
 
     &__tip-text {
         font-size: 22rpx;
-        color: #4b5563;
         line-height: 1.6;
+        color: #4b5563;
     }
 
     &__footer {
-        margin-top: 80rpx;
+        /* 用 padding 而非 margin：内容少时也不会把页脚顶到屏幕中间 */
+        padding: 60rpx 0 40rpx;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -495,6 +542,7 @@ function goCache() {
     &__footer-text {
         font-size: 24rpx;
         color: #3d434e;
+        letter-spacing: 1rpx;
     }
 }
 
@@ -556,6 +604,12 @@ function goCache() {
     &__ops {
         display: flex;
         margin-top: 36rpx;
+        /*
+         * 用 gap 控制两键间距，不用 `:first-child` ——
+         * scoped 编译后 uni-app 会给选择器附加属性，:first-child
+         * 在部分平台匹配不到，表现为「取消」键贴着「保存」键。
+         */
+        gap: 20rpx;
     }
 
     &__btn {
@@ -566,10 +620,6 @@ function goCache() {
         justify-content: center;
         border-radius: 38rpx;
         background-color: #1d2128;
-    }
-
-    &__btn:first-child {
-        margin-right: 20rpx;
     }
 
     &__btn--primary {

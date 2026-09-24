@@ -122,3 +122,53 @@ export function clearActiveRoom() {
         /* 忽略 */
     }
 }
+
+/* ------------------------------------------------------------------
+ * 房主换片：选片结果的跨页传递
+ * ------------------------------------------------------------------ */
+
+const PICK_KEY = 'yinghua_pending_pick';
+
+export interface PendingPick {
+    vodId: number;
+    vodName: string;
+    vodPic: string;
+}
+
+/**
+ * 暂存「房主刚选中的影片」。
+ *
+ * 为什么用存储而不是页面参数：选片页是**独立页面**（用 navigateTo 打开，
+ * 房间页留在栈里不销毁，通话因此不断），选完要 `navigateBack` 返回。
+ * 返回时无法带参，只能借存储把结果交回房间页。
+ *
+ * 房间页在 onShow 里读取并立即清除，保证一次性消费 ——
+ * 否则用户下次从别的路径回到房间页，会被这条陈旧记录又切一次片。
+ */
+export function savePendingPick(pick: PendingPick) {
+    try {
+        uni.setStorageSync(PICK_KEY, pick);
+    } catch {
+        /* 忽略 */
+    }
+}
+
+/** 读取待应用的选片结果（无则返回 null）。 */
+export function loadPendingPick(): PendingPick | null {
+    try {
+        const v = uni.getStorageSync(PICK_KEY) as PendingPick | '';
+        if (v && typeof v === 'object' && v.vodId) return v;
+    } catch {
+        /* 忽略 */
+    }
+    return null;
+}
+
+/** 清除待应用的选片结果。 */
+export function clearPendingPick() {
+    try {
+        uni.removeStorageSync(PICK_KEY);
+    } catch {
+        /* 忽略 */
+    }
+}

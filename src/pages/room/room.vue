@@ -15,10 +15,14 @@
                 :autoplay="true"
                 :initial-time="0"
                 :playback-rate="playbackRate"
+                :collections="collections"
+                :current-index="currentIndex"
+                :title="playerTitle"
                 @timeupdate="onTimeUpdate"
                 @ratechange="onRateChange"
                 @landscapechange="onLandscapeChange"
                 @orientationchange="onOrientationChange"
+                @episodechange="onEpisodeChange"
                 @ended="onEnded" />
 
             <view v-else class="room__loading">
@@ -26,7 +30,7 @@
                 <view v-if="showWaitTip" class="room__loading-tip">
                     <text class="room__loading-tip-text">{{ waitTip }}</text>
                     <view v-if="isHost" class="room__pick tap tap-solid" @click="goPickVideo">
-                        <text class="room__pick-text">去挑一部影片</text>
+                        <text class="room__pick-text">搜索并选择影片</text>
                     </view>
                 </view>
             </view>
@@ -161,8 +165,8 @@
         <view class="room__panel">
             <!--
                 正在看的影片。
-                放在最上方：进房间后用户第一个想知道的就是「现在在播什么」，
-                此前这一栏完全缺失，只能靠下方的播放器画面自己猜。
+                放在最上方：进房间后用户第一个想知道的就是「现在在播什么」。
+                房主右侧多一个「换片」入口 —— 换片全程不离开房间、不断通话。
             -->
             <view class="room__now">
                 <text class="room__now-label">正在看</text>
@@ -171,6 +175,21 @@
                     <text v-else class="room__now-name room__now-name--idle">{{ nowPlayingEmptyText }}</text>
                     <text v-if="episodeLabel" class="room__now-ep">{{ episodeLabel }}</text>
                 </view>
+                <view v-if="isHost" class="room__now-switch tap tap-solid" @click="goPickVideo">
+                    <text class="room__now-switch-text">{{ nowPlayingText ? '换片' : '选片' }}</text>
+                </view>
+            </view>
+
+            <!--
+                选片中的明确提示。
+                房主离开页面去选片时，双方都显示 —— 此前观众只有一句静态的
+                「等待房主选片」，房主真在挑片时反而看不出任何变化。
+            -->
+            <view v-if="hostPicking" class="room__picking">
+                <view class="room__picking-dot" />
+                <text class="room__picking-text">
+                    {{ isHost ? '正在选片，选好会自动切过去' : '房主正在选片，稍等一下' }}
+                </text>
             </view>
 
             <!-- 房间号：最需要分享的信息，放大成主视觉 -->
@@ -222,6 +241,29 @@
         </view>
 
         <!--
+            选集（页面内，无需进全屏）。
+            房主可点选，观众只读 —— 选集由房主统一决定，
+            否则两端各自切集会立刻不同步。
+
+            早先只能在播放器全屏后的面板里选，且那份数据还没传进去
+            （播放器拿不到剧集列表），等于完全没法选集。
+        -->
+        <view v-if="collections.length" class="room__episodes">
+            <view class="room__episodes-head">
+                <text class="room__episodes-title">选集</text>
+                <text class="room__episodes-count">
+                    {{ collections.length }} 集{{ isHost ? '' : ' · 由房主选择' }}
+                </text>
+            </view>
+            <scroll-view class="room__episodes-scroll" scroll-y :show-scrollbar="false">
+                <yh-episode
+                    :collections="collections"
+                    :current-index="currentIndex"
+                    @select="onGridSelect" />
+            </scroll-view>
+        </view>
+
+        <!--
             说明。
             只讲「怎么用」，不出现 WebRTC / 片源 / 信令 / CDN 这类技术词 ——
             用户不需要知道实现方式。
@@ -247,7 +289,7 @@
  */
 
 import { computed, ref } from 'vue';
-import { onHide, onLoad, onUnload } from '@dcloudio/uni-app';
+import { onBackPress, onHide, onLoad, onShow, onUnload } from '@dcloudio/uni-app';
 import type { Collection } from '@/api/types';
 import { resolvePlayUrl } from '@/services/play';
 import { getVodDetail } from '@/services/video';
@@ -257,9 +299,11 @@ import { createLogger } from '@/utils/logger';
 import {
     DRIFT_THRESHOLD,
     clearActiveRoom,
+    clearPendingPick,
     generateRoomId,
     isRoomCode,
     loadActiveRoom,
+    loadPendingPick,
     saveActiveRoom
 } from '@/utils/room-sync';
 
@@ -280,6 +324,25 @@ const syncHint = ref('');
 /** 通话状态 */
 const callEnabled = ref(false);
 const callStatus = ref<'idle' | 'connecting' | 'connected' | 'error'>('idle');
+
+/**
+ * 房主是否正在选片页挑影片。
+ *
+ * 用来守住 onHide —— 跳转到选片页也会触发 onHide，
+ * 而 onHide 原本会销毁通话（那是为「切后台释放摄像头」设计的）。
+ * 不加这个标志，房主一进选片页通话就断了。
+ */
+const pickingVideo = ref(false);
+
+/**
+ * 房间当前是否处于「房主正在选片」状态（双方都显示）。
+ *
+ * 房主：进入选片页时置 true，选完/返回时置 false。
+ * 观众：收到房主广播的 picking 消息时同步。
+ * 有它之前，观众侧只有一句静态的「等待房主选片」，
+ * 房主换片过程中完全看不出发生了什么。
+ */
+const hostPicking = ref(false);
 const hasRemote = ref(false);
 const audioOn = ref(true);
 const videoOn = ref(true);
@@ -567,12 +630,18 @@ const vodName = ref('');
 /** 观众侧：尚未拿到片源，属于正常等待状态（不是出错）。 */
 const showWaitTip = computed(() => !playStore.playUrl && !resolving.value);
 
-/** 等待提示：区分房主与观众两种身份。 */
+/**
+ * 等待提示：区分房主与观众两种身份。
+ *
+ * 房主侧的文案要说明「不用离开房间」——
+ * 这是本页最容易误解的地方：早先必须退回首页选片，
+ * 而那会销毁房间、断掉通话。
+ */
 const waitTip = computed(() => {
     if (isHost.value) {
-        return '回到「首页」挑一部影片播放，双方即可同屏观看。';
+        return '点下面的「选片」搜索影片即可，房间和通话都不会中断。';
     }
-    return '房主还没开始播放。留在这里即可，房主一开始播放就会自动同步过来。';
+    return '房主还没选片。留在这里就好，房主一开始播放就会自动同步过来。';
 });
 
 /** 加载提示文案。 */
@@ -602,6 +671,21 @@ const episodeLabel = computed(() => {
     const item = collections.value[currentIndex.value];
     if (item && item.title) return item.title;
     return `第 ${currentIndex.value + 1} 集`;
+});
+
+/**
+ * 全屏顶部栏标题：片名 + 集数。
+ *
+ * 全屏时画面铺满、看不到下方的「正在看」信息，顶部栏要把这两项
+ * 一并给出，否则用户不知道在看第几集。
+ */
+const playerTitle = computed(() => {
+    const name = nowPlayingText.value;
+    const ep = episodeLabel.value;
+    if (!name) return ep;
+    // 分集标题常常本身就含片名，重复时只留分集标题
+    if (ep && ep.includes(name)) return ep;
+    return ep ? `${name} ${ep}` : name;
 });
 
 let broadcastTimer: any = null;
@@ -645,15 +729,63 @@ async function loadDetail() {
     }
 }
 
+/**
+ * 切到指定集数（唯一入口）。
+ *
+ * 房主切集必须广播 —— 早先只有 onEnded 里改了本地下标，
+ * 观众完全不知情，会一直停在旧的一集。
+ *
+ * @param index   目标集下标
+ * @param silent  观众侧跟随房主时传 true，避免再广播回去形成回环
+ */
+function switchToEpisode(index: number, silent = false) {
+    const i = Number(index);
+    if (!Number.isInteger(i) || i < 0 || i >= collections.value.length) return;
+    if (i === currentIndex.value) return;
+
+    currentIndex.value = i;
+    resolve();
+
+    // 房主的切集要立刻同步给观众，不等下一个 3 秒轮播
+    if (!silent && isHost.value) {
+        pushSource();
+        /*
+         * 新的一集从 0 秒开始，进度基准也要立刻重置。
+         *
+         * 注意用 `broadcast` 而不是 `broadcastState` ——
+         * 后者只定义在渲染层，逻辑层（本页）调不到它。
+         * `broadcast` 是逻辑层方法，内部走指令通道送达渲染层。
+         */
+        const state = { playing: true, position: 0, updatedAt: Date.now() };
+        playStore.updateRemoteState(state);
+        rtcRef.value?.broadcast?.({ type: 'state', ...state });
+    }
+}
+
+/** 全屏内选集面板切集。 */
+function onEpisodeChange(index: number) {
+    if (!isHost.value) {
+        uni.showToast({ icon: 'none', title: '选片选集由房主决定' });
+        return;
+    }
+    switchToEpisode(index);
+}
+
+/** 播放页下方选集宫格切集。 */
+function onGridSelect(_item: Collection, index: number) {
+    onEpisodeChange(index);
+}
+
 /* ---------------- 播放同步 ---------------- */
 
 /**
- * 房主定时广播播放状态 + 片源信息 + 倍速。
+ * 房主定时广播播放状态 + 片源信息 + 倍速 + 选片状态。
  *
- * 三件事一起做：
+ * 四件事一起做：
  *   1. 进度对齐（观众按位置 seek）
  *   2. 片源对齐（观众侧若还没片源，或房主切了片，直接跟过去）
  *   3. 倍速对齐（倍速必须全体一致，否则进度会持续错位）
+ *   4. 选片状态（中途加入的观众也能看到「房主在选片」）
  *
  * 观众侧进房时只带邀请码、不知道看什么，靠这里拿到
  * vodId / 集数，再自行解析播放地址（两端各自拉流，不走 RTC）。
@@ -667,16 +799,16 @@ function startBroadcast() {
         const state = { playing: true, position, updatedAt: Date.now() };
         playStore.updateRemoteState(state);
 
-        // 片源信息：观众据此加载同一部影片
-        rtcRef.value?.broadcast?.({
-            type: 'source',
-            vodId: vodId.value,
-            index: currentIndex.value,
-            vodName: vodName.value
-        });
+        pushSource();
         rtcRef.value?.broadcastState(state);
         // 倍速随状态一起下发：它是「全体一致」的参数
         rtcRef.value?.broadcast?.({ type: 'rate', rate: playbackRate.value });
+        /*
+         * 选片状态也随轮播下发。
+         * 房主进选片页时会立即广播一次，但中途加入的观众收不到那次，
+         * 因此每轮都带上当前值，保证任何时刻进来的人都能看到提示。
+         */
+        rtcRef.value?.broadcast?.({ type: 'picking', on: hostPicking.value });
     };
 
     push();
@@ -706,12 +838,15 @@ function onTimeUpdate(payload: { currentTime: number }) {
     }
 }
 
+/**
+ * 一集播完：自动续下一集。
+ *
+ * 走统一的 switchToEpisode —— 它会顺带广播给观众，
+ * 早先这里只改本地下标，观众不会跟着切。
+ */
 function onEnded() {
     const next = currentIndex.value + 1;
-    if (next < collections.value.length) {
-        currentIndex.value = next;
-        resolve();
-    }
+    if (next < collections.value.length) switchToEpisode(next);
 }
 
 /* ---------------- 通话 ---------------- */
@@ -788,13 +923,20 @@ function onRemoteChange(on: boolean) {
 /**
  * 收到对端经数据通道发来的消息。
  *
- * 房主会发三类：
- *   source —— 正在看什么（观众据此加载同一部影片）
- *   state  —— 播放进度（观众据此对齐）
- *   rate   —— 播放倍速（观众跟随，保证进度不错位）
+ * 房主会发四类：
+ *   source  —— 正在看什么（观众据此加载同一部影片）
+ *   state   —— 播放进度（观众据此对齐）
+ *   rate    —— 播放倍速（观众跟随，保证进度不错位）
+ *   picking —— 房主正在选片（观众据此显示提示，不再干等）
  */
 function onChannelMessage(msg: any) {
     if (!msg) return;
+
+    if (msg.type === 'picking') {
+        if (isHost.value) return;
+        hostPicking.value = !!msg.on;
+        return;
+    }
 
     if (msg.type === 'source') {
         // 房主是片源基准，观众只跟随
@@ -870,15 +1012,89 @@ function copyRoomId() {
 }
 
 /**
- * 房主去挑影片。
+ * 房主去挑影片（换片）。
  *
- * 房间号已存进本地（见 saveActiveRoom），从首页选片后回到房间页
- * 会自动复用同一房间，因此这里只需回首页即可。
+ * 关键：用 `navigateTo` 打开搜索页，**不用 switchTab 回首页**。
+ * switchTab 会销毁房间页（触发 onUnload），通话当场断掉、
+ * 观众被留在原地，回来还得重建房间重发邀请码。
+ * navigateTo 只是把选片页压栈，房间页留在栈里，通话全程不断。
+ *
+ * 同时置 pickingVideo 标志，让 onHide 放行（见 onHide 的说明）。
  */
 function goPickVideo() {
-    uni.switchTab({
-        url: '/pages/index/index',
-        fail: () => uni.navigateTo({ url: '/pages/index/index' })
+    pickingVideo.value = true;
+    hostPicking.value = true;
+    // 先广播给观众，让他们立刻看到「房主在选片」
+    broadcastPicking(true);
+
+    uni.navigateTo({
+        url: '/pages/search/search?mode=pick',
+        fail: () => {
+            // 打开失败要复位，否则 onHide 会一直放行、通话不再随切后台释放
+            pickingVideo.value = false;
+            hostPicking.value = false;
+            broadcastPicking(false);
+            uni.showToast({ icon: 'none', title: '打开失败，请重试' });
+        }
+    });
+}
+
+/**
+ * 广播「房主正在选片」状态。
+ *
+ * 观众据此在等待页显示明确提示，而不是干等。
+ */
+function broadcastPicking(on: boolean) {
+    if (!isHost.value) return;
+    rtcRef.value?.broadcast?.({ type: 'picking', on });
+}
+
+/**
+ * 应用选片结果（房主从选片页返回时调用）。
+ *
+ * 换片等价于「换一部影片 + 重置到第 1 集」，因此要清掉旧的
+ * 播放状态与剧集列表，再按新 vodId 重新加载详情。
+ */
+function applyPendingPick() {
+    const pick = loadPendingPick();
+    if (!pick) return;
+    // 一次性消费，避免下次误用
+    clearPendingPick();
+
+    log.info('房主换片', pick.vodName);
+
+    vodId.value = pick.vodId;
+    vodName.value = pick.vodName;
+    currentIndex.value = 0;
+    collections.value = [];
+    playStore.reset();
+
+    // 记进房间，跨页返回时能恢复
+    saveActiveRoom({
+        roomId: roomId.value,
+        isHost: isHost.value,
+        vodId: vodId.value,
+        index: 0
+    });
+
+    loadDetail();
+    // 立刻推一次片源，观众无需等下一个广播周期
+    pushSource();
+}
+
+/**
+ * 立即广播一次当前片源。
+ *
+ * 正常广播是 3 秒一轮，换片这种「用户主动触发」的动作
+ * 应当立刻生效，否则观众要盯着旧画面等 3 秒。
+ */
+function pushSource() {
+    if (!isHost.value) return;
+    rtcRef.value?.broadcast?.({
+        type: 'source',
+        vodId: vodId.value,
+        index: currentIndex.value,
+        vodName: vodName.value
     });
 }
 
@@ -962,6 +1178,26 @@ function initPipPosition() {
     }
 }
 
+/**
+ * 返回键的优先顺序：先收全屏内的选集面板，再退全屏，最后才离开页面。
+ *
+ * 与播放页保持一致。若不这样处理，全屏下按返回会直接退出页面，
+ * 而用户的本意通常只是「退出全屏」。
+ *
+ * 面板状态住在渲染层，逻辑层取不到，故用「请它收起」的方式询问：
+ * 播放器返回是否真的收起了，据此决定要不要吃掉这次返回。
+ */
+onBackPress(() => {
+    if (playerRef.value?.closeEpisodePanel?.()) {
+        return true;
+    }
+    if (playerFullscreen.value) {
+        playerRef.value?.exitFullscreen?.();
+        return true;
+    }
+    return false;
+});
+
 onLoad(options => {
     const optVodId = Number(options?.vodId || 0);
     currentIndex.value = Number(options?.index || 0);
@@ -1016,13 +1252,21 @@ onLoad(options => {
 });
 
 /**
- * 切后台时挂断。
+ * 页面隐藏时挂断。
  *
  * 必须同时关掉悬浮窗（callEnabled=false），否则回到前台会看到
  * 一个「还在但已断开」的窗口，用户点屏幕没有任何反应。
  * 摄像头/麦克风也必须在后台释放，避免长期占用与耗电。
+ *
+ * **例外：房主去选片页时要放行。**
+ * onHide 对「切后台」与「页内跳转」一视同仁，而跳去选片页
+ * 只是把新页面压栈、房间页仍在栈里活着。若无条件销毁通话，
+ * 房主一进选片页通话就断，观众被晾在原地 ——
+ * 这正是「换片必须重开房间」的根因。
  */
 onHide(() => {
+    if (pickingVideo.value) return;
+
     if (callEnabled.value) {
         rtcRef.value?.destroy?.();
         callEnabled.value = false;
@@ -1031,6 +1275,24 @@ onHide(() => {
         localReady.value = false;
         stopBroadcast();
     }
+});
+
+/**
+ * 页面重新显示。
+ *
+ * 房主从选片页返回时会走这里，检查是否有待应用的选片结果。
+ * 用 onShow 而不是 onLoad —— onLoad 只在首次进入页面时触发一次，
+ * 从选片页返回不会重新执行。
+ */
+onShow(() => {
+    if (!pickingVideo.value) return;
+
+    pickingVideo.value = false;
+    hostPicking.value = false;
+    broadcastPicking(false);
+
+    // 房主选中了影片才需要换片；直接返回则什么都不做
+    if (isHost.value) applyPendingPick();
 });
 
 onUnload(() => {
@@ -1411,6 +1673,47 @@ onUnload(() => {
         text-overflow: ellipsis;
     }
 
+    /* 「换片 / 选片」入口：房主专属 */
+    &__now-switch {
+        flex-shrink: 0;
+        margin-left: 16rpx;
+        padding: 10rpx 26rpx;
+        border-radius: 999rpx;
+        background-color: rgba(240, 166, 60, 0.16);
+    }
+
+    &__now-switch-text {
+        font-size: 24rpx;
+        color: #f0a63c;
+    }
+
+    /* 选片中提示：带一个呼吸的小圆点，表明「正在进行」 */
+    &__picking {
+        display: flex;
+        align-items: center;
+        margin-bottom: 20rpx;
+        padding: 16rpx 22rpx;
+        border-radius: 12rpx;
+        background-color: rgba(240, 166, 60, 0.12);
+    }
+
+    &__picking-dot {
+        flex-shrink: 0;
+        width: 12rpx;
+        height: 12rpx;
+        margin-right: 14rpx;
+        border-radius: 50%;
+        background-color: #f0a63c;
+        animation: room-picking-blink 1.1s ease-in-out infinite;
+    }
+
+    &__picking-text {
+        flex: 1;
+        min-width: 0;
+        font-size: 24rpx;
+        color: #f0a63c;
+    }
+
     /* 房间号：当作分享凭证，用大号等宽字突出 */
     &__code {
         display: flex;
@@ -1532,6 +1835,60 @@ onUnload(() => {
         font-size: 24rpx;
         line-height: 1.7;
         color: #6b7280;
+    }
+
+    /* ---------- 选集 ---------- */
+
+    /*
+     * 与其它卡片同外观。
+     * 宫格用限高滚动而非直接铺开：动辄上百集的剧会把页面撑得极长，
+     * 下面的说明与操作都被推到很远。
+     */
+    &__episodes {
+        margin: 24rpx;
+        padding: 28rpx 28rpx 24rpx;
+        border-radius: 16rpx;
+        background-color: #14171c;
+        border: 1rpx solid rgba(255, 255, 255, 0.05);
+    }
+
+    &__episodes-head {
+        display: flex;
+        align-items: baseline;
+        margin-bottom: 20rpx;
+    }
+
+    &__episodes-title {
+        font-size: 30rpx;
+        font-weight: 600;
+        color: #e8eaed;
+    }
+
+    &__episodes-count {
+        flex: 1;
+        margin-left: 14rpx;
+        font-size: 22rpx;
+        color: #6b7280;
+    }
+
+    &__episodes-scroll {
+        /* 约 6 行的高度：够用又不至于占满整屏 */
+        height: 520rpx;
+    }
+}
+
+/*
+ * 选片指示灯的呼吸动画。
+ * 放在 .room 之外：keyframes 不需要选择器作用域，
+ * 写在嵌套里会随 scoped 属性一起被重写，反而容易失效。
+ */
+@keyframes room-picking-blink {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.25;
     }
 }
 </style>
