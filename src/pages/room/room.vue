@@ -1,6 +1,6 @@
 <template>
     <view class="room">
-        <yh-nav title="一起看" />
+        <yh-nav class="room__nav" title="一起看" />
 
         <!--
             播放器区。
@@ -138,12 +138,18 @@
         </view>
 
         <!--
-            通话控制条。
-
-            **仅非全屏时显示**：全屏时同样的按钮已内嵌在通话悬浮窗里，
-            若再浮一条横条会与它重复，并且横条会压住播放器的进度条。
+            下半部分：只在这一层滚动。
+            导航栏与播放器区固定不动 —— 与播放页保持一致，
+            否则向上滑时视频会被滚出屏幕，看不见画面。
         -->
-        <view v-if="!playerFullscreen" class="room__call-bar">
+        <scroll-view class="room__body" scroll-y :show-scrollbar="false">
+            <!--
+                通话控制条。
+
+                **仅非全屏时显示**：全屏时同样的按钮已内嵌在通话悬浮窗里，
+                若再浮一条横条会与它重复，并且横条会压住播放器的进度条。
+            -->
+            <view v-if="!playerFullscreen" class="room__call-bar">
             <view v-if="!callEnabled" class="room__bar-btn room__bar-btn--primary tap tap-solid" @click="startCall">
                 <text class="room__bar-text room__bar-text--primary">开启视频通话</text>
             </view>
@@ -277,6 +283,10 @@
                 进来后会看到同一部影片，进度自动保持一致；打开通话就能边看边聊。
             </text>
         </view>
+
+        <!-- 底部留白，避免最后一块内容贴着屏幕底边 -->
+        <view class="room__tail" />
+        </scroll-view>
     </view>
 </template>
 
@@ -460,25 +470,20 @@ const pipStyle = computed(() => ({
 /**
  * 把坐标夹在可视区域内。
  *
- * 四周边距只避开真正会挡事的元素：
- *   · 顶部：竖屏有状态栏 + 自定义导航栏；横屏几乎没有
- *   · 底部：全屏时避让播放器进度条；竖屏时避让页面下方的通话条
+ * 只保留「不让窗口跑出屏幕」这一条最低约束 ——
+ * 用户明确要求拖到哪里就是哪里、整个屏幕都能放，不要吸附也不要做
+ * 上半屏之类的额外限制。否则窗口一旦被拖出可视区就再也抓不回来。
  *
- * 不再限制「只能在上半屏」—— 用户反馈那样太死板。
- * 代价是被拖到字幕区时会挡字，但这属于用户自己的选择，
- * 且随时能拖走，比强行限制更符合直觉。
+ * 四周边距都取 0：允许贴着边缘，甚至压住导航栏与进度条，
+ * 那属于用户自己的选择，随时能再拖走。
  */
 function clampPip(x: number, y: number) {
-    const padTop = isLandscapeScreen.value ? 8 : 60;
-    // 全屏时底部有一条进度条，留 44 让它不被压住
-    const padBottom = playerFullscreen.value ? 44 : isLandscapeScreen.value ? 8 : 90;
-
-    const maxX = Math.max(8, screenW.value - pipWidth.value - 8);
-    const maxY = Math.max(padTop, screenH.value - pipHeight.value - padBottom);
+    const maxX = Math.max(0, screenW.value - pipWidth.value);
+    const maxY = Math.max(0, screenH.value - pipHeight.value);
 
     return {
-        x: Math.min(Math.max(8, x), maxX),
-        y: Math.min(Math.max(padTop, y), maxY)
+        x: Math.min(Math.max(0, x), maxX),
+        y: Math.min(Math.max(0, y), maxY)
     };
 }
 
@@ -531,22 +536,17 @@ function onPipTouchMove(e: any) {
 /**
  * 结束拖动。
  *
- * 展开态吸附到最近的左右边缘（小窗手感）；
- * 收起态刻意不吸附 —— 它只有 40px 宽，吸边后更容易被误触。
+ * **不做任何吸附** —— 用户明确要求「拖到哪里是哪里」。
+ * 早先松手会自动贴到最近的左右边缘，导致窗口总在两边、
+ * 想放在中间挡不到的位置却放不了。
+ *
+ * 这里只做一次边界夹取，防止拖出屏幕后抓不回来。
  */
 function onPipTouchEnd() {
     if (!dragOrigin) return;
     dragOrigin = null;
     if (!dragMoved) return;
 
-    if (!pipMini.value) {
-        const w = pipWidth.value;
-        const center = pipX.value + w / 2;
-        const goLeft = center < screenW.value / 2;
-        pipX.value = goLeft ? 8 : Math.max(8, screenW.value - w - 8);
-    }
-
-    // 夹一次：形态切换后高度变化可能越界
     const next = clampPip(pipX.value, pipY.value);
     pipX.value = next.x;
     pipY.value = next.y;
@@ -1443,17 +1443,43 @@ onUnload(() => {
 
 <style lang="scss" scoped>
 .room {
-    min-height: 100vh;
-    min-height: 100dvh;
+    /*
+     * 整页锁定视口高度：页面本身不滚动，滚动交给下方 scroll-view。
+     *
+     * 与播放页保持一致 —— 早先是 min-height + 自然滚动，
+     * 向上滑时视频区会被滚出屏幕，用户看不到画面。
+     */
+    height: 100vh;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
     background-color: #0b0d10;
-    /* 底部安全区：说明文字会被 iPhone 小黑条压住 */
-    padding-bottom: calc(60rpx + env(safe-area-inset-bottom));
 
+    /* 导航栏固定不滚动：flex:none 保证不被下方内容挤压缩高 */
+    &__nav {
+        flex: none;
+    }
+
+    /* 播放器区固定不滚动 */
     &__stage {
         position: relative;
+        flex: none;
         width: 100%;
         height: 420rpx;
         background-color: #000;
+    }
+
+    /* 滚动区：占满剩余高度 */
+    &__body {
+        flex: 1;
+        /* min-height:0 必须加 —— flex 子项默认 min-height:auto，
+           不加则内容撑开后整页会被顶出视口、滚动失效 */
+        min-height: 0;
+    }
+
+    &__tail {
+        height: calc(40rpx + env(safe-area-inset-bottom));
     }
 
     &__player {
