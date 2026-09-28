@@ -2012,7 +2012,6 @@
                 this.updateLoading();
                 this.emit('error', { type: data && data.type, details: data && data.details });
             },
-            },
 
             /**
              * 更新顶部栏标题。
@@ -3928,7 +3927,7 @@
                     /* 实例已销毁，静默丢弃 */
                 }
             }
-
+        }
     };
 </script>
 

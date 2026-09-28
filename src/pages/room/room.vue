@@ -462,34 +462,88 @@ const pipScaleIdx = ref(0);
 /** 当前缩放倍数，供样式里的 calc() 使用 */
 const pipScale = computed(() => PIP_SCALES[pipScaleIdx.value]);
 
-/** 底部操作条高度（px），随尺寸档位等比放大 */
-const PIP_ACTS_H = 30;
-
-/** 展开态基准宽（px）：横屏略宽，竖屏收窄。 */
-const PIP_BASE_W = computed(() => (isLandscapeScreen.value ? 132 : 112));
+/**
+ * 悬浮窗尺寸的约束基准：屏幕的**短边**。
+ *
+ * 不能直接拿屏宽做基准 —— 横屏全屏时屏宽会变成 800 之类的大值，
+ * 于是「宽度上限 = 屏宽 62%」算出 496px，浮窗被撑得极宽；
+ * 而浮窗高度是按「宽 / 0.75」反算的竖版比例，宽度一撑高就跟着涨，
+ * 在只有 375px 高的横屏里几乎没有纵向余量：
+ *
+ *   实测 800x375 横屏 · 展开态中档 → 浮窗 174x272，纵向仅可拖 0..103px
+ *
+ * 结果就是「全屏时浮窗被钉在屏幕上方、拖不下来」。
+ * 改用短边（横屏时即屏高）作基准，浮窗在横屏下自然变小，
+ * 纵向才有足够的拖动空间。
+ *
+ * 注意 screenW/screenH 会被 syncViewport() 实时刷新，
+ * 因此这里始终反映当前屏幕状态。
+ */
+const pipBasis = computed(() => Math.min(screenW.value, screenH.value));
 
 /**
- * 展开态宽度（px）。
+ * 底部操作条高度（px）。
  *
- * 上限按屏宽 62% 夹取：最大档在窄屏上会盖住大半个画面，
- * 再大就没有「边看边聊」的意义了。
+ * **固定值，不随档位缩放** —— 必须与样式里 `&__pip-acts` 的 height 一致，
+ * 否则反算出的宽度会与实际渲染不符（画面区被撑变形）。
+ *
+ * 不随档位放大的理由见样式注释：浮窗高度有上限，
+ * 操作条若跟着变大，最大档的画面区反而比中档小。
  */
-const pipWidth = computed(() => {
-    if (pipMini.value) return PIP_MINI_W;
-    const scaled = PIP_BASE_W.value * pipScale.value;
-    return Math.round(Math.min(scaled, screenW.value * 0.62));
-});
+const PIP_ACTS_H = 30;
+
+/**
+ * 展开态高度上限：短边的 62%。
+ *
+ * 上限的作用是保证纵向**留出足够的拖动余量** ——
+ * 浮窗本就要能满屏放，若它自己占掉七成高度，可拖范围就只剩一小条，
+ * 用户会觉得「拖不动」。横屏场景尤其明显：屏高仅 375px，
+ * 浮窗按 3:4 竖版自然尺寸会长到 270px 以上，纵向只剩 105px。
+ *
+ * 取 62%（横屏约 232px）而非更小值，是为了让**三个档位仍有区分度**：
+ * 上限压得太低时中档与最大档会双双顶到上限、尺寸完全一样，
+ * 双击放大就没有效果了。
+ */
+const PIP_MAX_H_RATIO = 0.62;
 
 /**
  * 展开态高度。
  *
- * 画面区按 3:4 竖版反算（宽 / 0.75）再加底部操作条 ——
- * 通话是竖构图的半身像，用竖版比例比横版更省侧边空间。
- * 操作条内嵌在窗口内（非独立浮层），因此必须计入高度。
+ * **缩放档位作用在高度上**，宽度再由高度反算 —— 这样三个档位
+ * 在两种屏幕方向下都保持「小 → 中 → 大」的单调递增。
+ *
+ * 早先的写法是「先算宽度再按 3:4 反算高度」，在横屏下会与
+ * 高度上限互相打架：上限把高度截住后，宽度反而越大档位越窄。
+ *
+ * 基准取短边的 34%：横屏约 128、竖屏约 227，
+ * 乘档位系数（1 / 1.32 / 1.72）后中档恰好接近上限、
+ * 最大档顶到上限，三档尺寸因此分明。
  */
 const pipHeight = computed(() => {
     if (pipMini.value) return PIP_MINI_H;
-    return Math.round(pipWidth.value / 0.75) + Math.round(PIP_ACTS_H * pipScale.value);
+    const base = pipBasis.value * 0.34;
+    const scaled = base * pipScale.value;
+    const cap = pipBasis.value * PIP_MAX_H_RATIO;
+    /*
+     * 下限 150px。
+     *
+     * 横屏下短边仅 375，基准 34% 算出的最小档高度只有 127px，
+     * 减去操作条后画面区只剩 97px —— 对方的脸几乎看不清。
+     * 抬到 150px 后画面区约 120px，可用且与中档仍有区分度。
+     */
+    return Math.round(Math.max(Math.min(scaled, cap), 150));
+});
+
+/**
+ * 展开态宽度。
+ *
+ * 由高度反算（去掉**当前档位**的操作条后按 3:4 竖版比例），
+ * 再受短边 62% 约束 —— 保证竖屏下不会盖住大半个画面。
+ */
+const pipWidth = computed(() => {
+    if (pipMini.value) return PIP_MINI_W;
+    const byHeight = (pipHeight.value - PIP_ACTS_H) * 0.75;
+    return Math.round(Math.min(byHeight, pipBasis.value * 0.62));
 });
 
 /** 悬浮窗内联样式：位置 + 尺寸 + 缩放系数（供内部 calc 用）。 */
@@ -502,6 +556,50 @@ const pipStyle = computed(() => ({
 }));
 
 /**
+ * 同步屏幕尺寸到响应式状态，并返回当前值。
+ *
+ * 不能依赖缓存值 —— 横屏锁定是**异步**的：播放器调 lockOrientation
+ * 后立刻 emit landscapechange，此刻屏幕还没真正转过来，
+ * `window.innerHeight` 仍是竖屏的 667。若此时把 667 记下来当屏高，
+ * 横屏下就会算出 `maxY = 667 - 浮窗高` 这种远超真实屏幕的边界 ——
+ * 表现为「浮窗能往下拖，但一拖就出屏，看起来像卡在上面」。
+ *
+ * 因此**每次拖动都现读**，并顺手写回 screenW/screenH，
+ * 保证「浮窗尺寸」与「拖动边界」用的是同一份数据（否则两者错配，
+ * 边界算出来会比浮窗实际需要的大或小）。
+ */
+function syncViewport() {
+    let w = 0;
+    let h = 0;
+
+    // 优先用真实视口（CSS 铺满后的实际渲染尺寸）
+    if (typeof window !== 'undefined') {
+        w = window.innerWidth || 0;
+        h = window.innerHeight || 0;
+    }
+
+    // 视口取不到时退回系统信息
+    if (!w || !h) {
+        try {
+            const info = uni.getSystemInfoSync();
+            w = info.windowWidth || info.screenWidth || 375;
+            h = info.windowHeight || info.screenHeight || 667;
+        } catch (e) {
+            /* 忽略 */
+        }
+    }
+
+    w = w || 375;
+    h = h || 667;
+
+    // 只在真正变化时写回，避免每次拖动都触发无关的响应式更新
+    if (screenW.value !== w) screenW.value = w;
+    if (screenH.value !== h) screenH.value = h;
+
+    return { w, h };
+}
+
+/**
  * 把坐标夹在可视区域内。
  *
  * 只保留「不让窗口跑出屏幕」这一条最低约束 ——
@@ -512,8 +610,9 @@ const pipStyle = computed(() => ({
  * 那属于用户自己的选择，随时能再拖走。
  */
 function clampPip(x: number, y: number) {
-    const maxX = Math.max(0, screenW.value - pipWidth.value);
-    const maxY = Math.max(0, screenH.value - pipHeight.value);
+    const { w, h } = syncViewport();
+    const maxX = Math.max(0, w - pipWidth.value);
+    const maxY = Math.max(0, h - pipHeight.value);
 
     return {
         x: Math.min(Math.max(0, x), maxX),
@@ -1467,26 +1566,42 @@ function onOrientationChange() {
 }
 
 /**
- * 初始化悬浮窗位置。
+ * 重新读取屏幕尺寸并夹取悬浮窗位置。
  *
- * 必须在拿到真实窗口尺寸后调用：初始位置依赖屏宽（右上角），
- * 写死数值在平板/小屏上会跑出可视区。
+ * 尺寸统一走 syncViewport（优先真实视口），不再自己判断是否全屏 ——
+ * 播放器全屏是 CSS `position: fixed` 铺满，而 App 端 WebView 的
+ * `windowWidth/Height` **不随全屏改变**（它反映页面视口，
+ * 不是播放器的铺满区域），所以任何时候都该以真实视口为准。
+ *
+ * 另外横屏锁定是**异步**的：调用后屏幕要过一小会儿才真正转过来。
+ * 这里额外延迟再同步一次，避免拿到「刚锁定、还没转」的旧尺寸 ——
+ * 那会让横屏下的可拖范围算成竖屏的数值（拖下去就出屏）。
  */
 function initPipPosition() {
-    try {
-        const info = uni.getSystemInfoSync();
-        screenW.value = info.windowWidth || info.screenWidth || 375;
-        screenH.value = info.windowHeight || info.screenHeight || 667;
-    } catch (e) {
-        /* 取不到就沿用默认值 */
-    }
-    if (!pipPlaced.value) placePipDefault();
-    else {
-        // 已在别处放过：只重新夹一次边界（旋转后宽高变了）
+    syncViewport();
+
+    if (!pipPlaced.value) {
+        placePipDefault();
+    } else {
+        // 已放过：重新夹一次边界（旋转后可用范围变了）
         const next = clampPip(pipX.value, pipY.value);
         pipX.value = next.x;
         pipY.value = next.y;
     }
+
+    /*
+     * 方向锁定是异步的，稍后再校正一次。
+     *
+     * 两次都用同一套逻辑，因此即使第一次拿到的还是旧尺寸，
+     * 第二次也能把浮窗拉回正确范围；若第二次读到的尺寸没变，
+     * syncViewport 内部的比对会让它成为空操作，不产生额外开销。
+     */
+    setTimeout(() => {
+        syncViewport();
+        const next = clampPip(pipX.value, pipY.value);
+        pipX.value = next.x;
+        pipY.value = next.y;
+    }, 350);
 }
 
 /**
@@ -1782,23 +1897,29 @@ onUnload(() => {
      * 内嵌而非独立底部横条：全屏时横条会压住播放器进度条，
      * 也遮挡画面下缘；内嵌在通话窗里则完全不干扰影片。
      *
-     * 高度与间距随 --pip-scale 等比放大 —— 放大后按钮若不变大，
-     * 画面变大而按钮还是原尺寸会显得失衡、也难点。
+     * ⚠️ 高度**不随 --pip-scale 缩放**。
+     *
+     * 早先按档位等比放大，但浮窗高度有上限（短边 55%），
+     * 到了最大档高度已顶到上限、无法再增，操作条却还在变大 ——
+     * 结果画面区被反向压缩，双击「放大」反而更小：
+     *   实测面积 12288 → 20800 → 17910（最大档比中档还小）
+     * 而且放大浮窗并不会让这几个图标按钮更好点，
+     * 固定尺寸既省空间，也保证画面区随档位单调递增。
      */
     &__pip-acts {
         flex: none;
-        height: calc(30px * var(--pip-scale, 1));
+        height: 30px;
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: calc(20px * var(--pip-scale, 1));
+        gap: 20px;
         background-color: #14171c;
     }
 
-    /* 单个圆形按钮 */
+    /* 单个圆形按钮（同样固定尺寸，理由见上） */
     &__pact {
-        width: calc(22px * var(--pip-scale, 1));
-        height: calc(22px * var(--pip-scale, 1));
+        width: 22px;
+        height: 22px;
         border-radius: 50%;
         display: flex;
         align-items: center;
