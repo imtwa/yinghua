@@ -1208,6 +1208,21 @@ function onChannelOpen() {
 /** 本地媒体就绪（false 表示摄像头不可用，但不影响房间同步）。 */
 function onLocalReady(info: any) {
     localReady.value = !!(info && info.media);
+
+    /*
+     * 摄像头没拿到、但麦克风拿到了 → 本次是纯音频通话。
+     *
+     * 必须显式告知：此时通话能打通、能听到声音，只是双方都看不到画面，
+     * 而组件内部不会抛错 —— 用户只会以为是「视频功能坏了」。
+     * 早先这种情况完全静默，正是「能打电话但视频不行」的来源之一。
+     */
+    if (info && info.videoDropped) {
+        rtcMediaError.value = '摄像头未启用，当前为纯音频通话';
+        log.warn('摄像头未启用，已降级为纯音频');
+    } else if (info && info.media) {
+        // 恢复正常：清掉可能残留的降级提示
+        rtcMediaError.value = '';
+    }
 }
 
 /**

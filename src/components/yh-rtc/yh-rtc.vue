@@ -77,7 +77,19 @@ export default {
             mediaReady: false,
             /** 媒体失败原因（供界面展示与重试） */
             mediaError: '',
-            errorText: ''
+            errorText: '',
+            /**
+             * 取流结果：是否真的拿到了视频/音频轨。
+             *
+             * 由 acquireLocal 写入。用途是让上层如实区分三种状态：
+             *   · 有画面有声音（正常）
+             *   · 只有声音（摄像头失败已降级，需提示用户）
+             *   · 什么都没有（彻底失败）
+             * 早先只上报「有没有流」，摄像头失败降级成纯音频时
+             * 上层无从得知，用户只会觉得「视频坏了但没报错」。
+             */
+            mediaGotVideo: false,
+            mediaGotAudio: false
         };
     },
     computed: {
@@ -660,6 +672,7 @@ export default {
          */
         async acquireLocal() {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                console.warn('[rtc] 当前环境不支持 getUserMedia');
                 throw new Error('当前环境不支持摄像头采集');
             }
 
@@ -669,22 +682,70 @@ export default {
             const wantVideo = this.conf.initialVideo !== false;
             const wantAudio = this.conf.initialAudio !== false;
 
+            /*
+             * 降级链：音视频 → 纯音频。
+             *
+             * ⚠️ 曾经这里还有第三项 `{ video: false, audio: false }`，
+             * 是本次「视频通话没画面但也不报错」的根因：
+             * 该调用在规范上**合法且会成功**，返回一个不含任何轨道的空流，
+             * 于是摄像头失败时会被误判为「取流成功」——
+             * 不抛异常、不报错、不打日志，流里却一个轨道都没有。
+             * 表现为「电话能通（退成纯音频）、但没有画面、控制台无任何线索」。
+             *
+             * 现在去掉它：降级只能降到纯音频，全失败就如实抛错。
+             */
             const tries = [];
             if (wantVideo && wantAudio) {
-                tries.push({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: true });
+                tries.push({
+                    label: '音视频',
+                    constraints: {
+                        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+                        audio: true
+                    }
+                });
             }
-            if (wantAudio) tries.push({ video: false, audio: true });
-            tries.push({ video: false, audio: false });
+            if (wantAudio) {
+                tries.push({ label: '纯音频', constraints: { video: false, audio: true } });
+            }
+
+            console.log('[rtc] 开始取流，降级链:', tries.map(t => t.label).join(' → '));
 
             let lastErr = null;
-            for (const c of tries) {
+            for (const t of tries) {
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia(c);
+                    const stream = await navigator.mediaDevices.getUserMedia(t.constraints);
+                    const v = stream.getVideoTracks().length;
+                    const a = stream.getAudioTracks().length;
+                    console.log(`[rtc] 取流成功（${t.label}）: 视频轨 ${v} 条, 音频轨 ${a} 条`);
+
+                    /*
+                     * 空流一律视为失败。
+                     *
+                     * 即便前面的坑修掉了，某些内核仍可能返回无轨道的流
+                     * （例如设备被独占时）。若不拦住，后面
+                     * applyLocalTracksToPeer 会因找不到轨道而静默跳过，
+                     * 又变回「没画面也没日志」。
+                     */
+                    if (!v && !a) {
+                        console.warn(`[rtc] ${t.label} 返回了空流（无任何轨道），判为失败`);
+                        lastErr = new Error('取到的流不含任何轨道');
+                        continue;
+                    }
+
+                    // 记下降级结果，供上层如实上报「有没有画面」
+                    this.mediaGotVideo = v > 0;
+                    this.mediaGotAudio = a > 0;
+                    if (!v && wantVideo) {
+                        console.warn('[rtc] 摄像头未能启用，已降级为纯音频（对端将看不到画面）');
+                    }
                     return stream;
                 } catch (e) {
+                    console.warn(`[rtc] 取流失败（${t.label}）:`, (e && e.name) || '', (e && e.message) || e);
                     lastErr = e;
                 }
             }
+
+            console.error('[rtc] 所有取流尝试均失败');
             throw lastErr || new Error('无法访问摄像头/麦克风');
         },
 
@@ -854,16 +915,39 @@ export default {
          * 复杂度与风险都不划算。
          */
         async applyLocalTracksToPeer(peer) {
-            if (!peer || !this.localStream || typeof peer.getTransceivers !== 'function') return;
-            for (const t of peer.getTransceivers()) {
+            if (!peer || !this.localStream || typeof peer.getTransceivers !== 'function') {
+                console.warn('[rtc] 无法装配轨道: peer/流缺失或内核不支持 getTransceivers');
+                return;
+            }
+
+            const transceivers = peer.getTransceivers();
+            let filled = 0;
+
+            for (const t of transceivers) {
                 const kind = t.receiver && t.receiver.track ? t.receiver.track.kind : null;
                 if (!kind || !t.sender) continue;
                 const track = this.localStream.getTracks().find(x => x.kind === kind);
-                if (!track) continue;
+                if (!track) {
+                    /*
+                     * 该方向没有本地轨道。
+                     *
+                     * 最常见的成因：摄像头取流失败（降级为纯音频），
+                     * 于是 video 方向的 transceiver 找不到对应轨道，
+                     * 对端永远收不到画面 —— 这就是「视频通话没画面」
+                     * 在装配阶段的直接表现，必须打出来才看得见。
+                     */
+                    console.warn(`[rtc] ${kind} 方向无本地轨道，跳过（对端收不到该路媒体）`);
+                    continue;
+                }
                 try {
                     await t.sender.replaceTrack(track);
-                } catch (e) { /* 单个轨道失败不影响其它 */ }
+                    filled++;
+                } catch (e) {
+                    console.warn(`[rtc] ${kind} 轨道装配失败:`, (e && e.message) || e);
+                }
             }
+
+            console.log(`[rtc] 轨道装配完成: ${filled}/${transceivers.length} 个 transceiver 已填充`);
         },
 
         /**
@@ -960,10 +1044,30 @@ export default {
             try {
                 const stream = await this.acquireLocal();
                 await this.attachLocalStream(stream);
+
+                const hasVideo = stream.getVideoTracks().length > 0;
+                const hasAudio = stream.getAudioTracks().length > 0;
+                console.log(`[rtc] startMedia 完成: 视频 ${hasVideo ? '有' : '无'} / 音频 ${hasAudio ? '有' : '无'}`);
+
+                /*
+                 * 摄像头没拿到时明确告警。
+                 *
+                 * 这是「电话能打通、就是没画面」的直接原因 ——
+                 * 降级成纯音频后通话照常工作，用户只能看到黑屏，
+                 * 没有任何报错。这里把情况说清楚，便于对端提示
+                 * 「对方未开启摄像头」而不是傻等画面。
+                 */
+                if (!hasVideo) {
+                    console.warn('[rtc] 未取得视频轨，本次通话为纯音频（对端看不到你的画面）');
+                }
+
+                this.mediaReady = true;
                 this.emit('localready', {
                     media: true,
-                    hasVideo: stream.getVideoTracks().length > 0,
-                    hasAudio: stream.getAudioTracks().length > 0
+                    hasVideo,
+                    hasAudio,
+                    // 供页面区分「正常」与「已降级为纯音频」
+                    videoDropped: !hasVideo && hasAudio
                 });
                 return true;
             } catch (e) {
@@ -1323,16 +1427,51 @@ export default {
                 }
             };
 
-            // 远端轨道到达：为这个对端挂上画面
+            /*
+             * 远端轨道到达：为这个对端挂上画面。
+             *
+             * ⚠️ 不能依赖 `e.streams[0]`。
+             *
+             * 本组件用 `replaceTrack` 装配轨道（见 applyLocalTracksToPeer），
+             * 而 replaceTrack **不会把轨道绑定到某个 MediaStream** ——
+             * 因此对端 ontrack 触发时 `e.streams` 往往是**空数组**。
+             * 早先直接 `if (!stream) return;`，等于把画面全丢了：
+             * 连接正常、音频正常（音频轨也走同一条路），
+             * 但视频画面永远挂不上，且没有任何报错。
+             *
+             * 正确做法：streams 为空时自己建一个 MediaStream
+             * 把轨道加进去，再交给 video 元素播放。
+             */
             peer.ontrack = e => {
-                const stream = e.streams && e.streams[0];
-                if (!stream) return;
+                const kind = (e.track && e.track.kind) || '?';
+                console.log(`[rtc] 收到远端轨道: ${kind}`, 'streams:', (e.streams || []).length);
+
                 const tile = this.ensureTile(remoteId);
-                if (tile && tile.video.srcObject !== stream) {
-                    tile.video.srcObject = stream;
-                    tile.video.play().catch(() => {});
-                    this.watchRemoteTracks(remoteId, stream);
+                if (!tile) {
+                    console.warn('[rtc] 远端轨道到达但 tile 创建失败');
+                    return;
                 }
+
+                // 优先用内核给的 stream；没有就自己攒一个
+                let stream = e.streams && e.streams[0];
+                if (!stream) {
+                    // 复用已建的容器流，避免每条轨道各建一个导致后到的覆盖先到的
+                    if (!tile._stream) tile._stream = new MediaStream();
+                    stream = tile._stream;
+                    if (e.track && !stream.getTracks().includes(e.track)) {
+                        stream.addTrack(e.track);
+                    }
+                }
+
+                if (tile.video.srcObject !== stream) {
+                    tile.video.srcObject = stream;
+                }
+                // 无论 srcObject 是否变化都要尝试播放：轨道后到时
+                // video 已存在但可能仍处于暂停态
+                tile.video.play().catch(err => {
+                    console.warn('[rtc] 远端画面播放被拦:', (err && err.message) || err);
+                });
+                this.watchRemoteTracks(remoteId, stream);
             };
 
             // 连接状态
@@ -1589,27 +1728,49 @@ export default {
          */
         watchRemoteTracks(peerId, stream) {
             const tile = this.tiles[peerId];
-            if (!tile || tile._bound) return;
-            tile._bound = true;
+            if (!tile) return;
 
-            // 存成 _redraw：昵称变化时由 updateTileTag 复用同一套绘制逻辑
-            tile._redraw = () => {
-                const cam = stream.getVideoTracks()[0];
-                const mic = stream.getAudioTracks()[0];
-                const camOff = !cam || cam.muted || cam.readyState === 'ended';
-                const micOff = !mic || mic.muted || mic.readyState === 'ended';
+            /*
+             * `_redraw` 只建一次，但**每次进来都要重新画**。
+             *
+             * 早先是 `if (tile._bound) return;` —— 第二次 ontrack
+             * （视频轨比音频轨晚到时）会直接返回，于是：
+             *   1. 新到的视频轨没有挂上 mute/unmute/ended 监听
+             *   2. 画面状态不重绘，标签一直停在「（摄像头关）」
+             * 而实际上视频已经在播了 —— 用户看到的是「有画面但标着摄像头关」，
+             * 或更糟：标签与画面状态长期不一致。
+             */
+            if (!tile._redraw) {
+                /*
+                 * 从 video 元素的 srcObject 现读，而不是捕获入参 stream。
+                 *
+                 * 因为 `_redraw` 只建一次，若捕获首次的 stream，
+                 * 之后重新协商换了新流，重绘读到的仍是旧流（永远是「摄像头关」）。
+                 */
+                tile._redraw = () => {
+                    const cur = tile.video && tile.video.srcObject;
+                    const cam = cur && cur.getVideoTracks ? cur.getVideoTracks()[0] : null;
+                    const mic = cur && cur.getAudioTracks ? cur.getAudioTracks()[0] : null;
+                    const camOff = !cam || cam.muted || cam.readyState === 'ended';
+                    const micOff = !mic || mic.muted || mic.readyState === 'ended';
 
-                tile.wrap.classList.toggle('is-novideo', camOff);
-                const name = this.peerNames[peerId] || '好友';
-                tile.tag.textContent = camOff ? `${name}（摄像头关）` : name;
-                tile.tag.classList.toggle('is-muted', micOff);
-            };
+                    tile.wrap.classList.toggle('is-novideo', camOff);
+                    const name = this.peerNames[peerId] || '好友';
+                    tile.tag.textContent = camOff ? `${name}（摄像头关）` : name;
+                    tile.tag.classList.toggle('is-muted', micOff);
+                };
+            }
 
+            // 给**尚未绑定过**的轨道挂监听：晚到的新轨道同样要挂
+            if (!tile._boundTracks) tile._boundTracks = new Set();
             for (const track of stream.getTracks()) {
+                if (tile._boundTracks.has(track)) continue;
+                tile._boundTracks.add(track);
                 track.addEventListener('mute', tile._redraw);
                 track.addEventListener('unmute', tile._redraw);
                 track.addEventListener('ended', tile._redraw);
             }
+
             tile._redraw();
         },
 
