@@ -32,6 +32,23 @@ export const CACHE_DIR = 'yinghua_cache';
 /** 同时在下的分片数。过高会被源站限流，过低则慢。 */
 const CONCURRENCY = 3;
 
+/**
+ * 进度落盘的最小间隔（毫秒）。
+ *
+ * 单集分片数可达两千以上（实测），逐片同步写存储会拖慢下载并卡 UI。
+ * 取 600ms：既让界面进度条看起来连续（约每秒刷新 1.7 次），
+ * 又把写存储次数从「分片数」压到「秒数 × 1.7」。
+ */
+const PROGRESS_FLUSH_MS = 600;
+
+/**
+ * 单个分片的下载超时（毫秒）。
+ *
+ * 实测平均分片约 0.69MB，正常网络下远快于此值；
+ * 取 60 秒是给弱网留足余量，同时避免挂死的请求拖垮整集任务。
+ */
+const DOWNLOAD_TIMEOUT = 60000;
+
 /** 单集缓存状态。 */
 export type CacheStatus = 'pending' | 'downloading' | 'done' | 'error';
 
@@ -152,11 +169,27 @@ export interface ParsedManifest {
     duration: number;
 }
 
-/** 解析 m3u8 索引。 */
+/**
+ * 解析 m3u8 索引。
+ *
+ * ⚠️ 分片**必须去重**。
+ *
+ * 实测本项目的片源会把同一段广告（`/video/adjump/...`）在索引里
+ * 重复列出多次，一共 2142 行里就有 9 组重复。
+ * 不去重会踩两个坑：
+ *   1. 本地文件名由 URL 哈希决定，重复的 URL 映射到**同一个文件**，
+ *      于是并发池会同时下载并写同一个目标文件（copyInto 是先删后拷），
+ *      两个 worker 相互删对方的产物 → 必然有一个报错，
+ *      整集因此被判成「N 个分片下载失败」而无法离线播放。
+ *   2. `total` 被重复计数，进度分母虚大、百分比永远到不了 100%。
+ *
+ * 去重后每个资源只下一次，进度与文件都正确。
+ */
 export function parseManifest(text: string, baseUrl: string): ParsedManifest {
     const segments: string[] = [];
     const keys: string[] = [];
     const maps: string[] = [];
+    const seen = new Set<string>();
     let duration = 0;
 
     for (const raw of text.split('\n')) {
@@ -169,18 +202,36 @@ export function parseManifest(text: string, baseUrl: string): ParsedManifest {
             continue;
         }
         if (line.startsWith('#EXT-X-KEY:')) {
+            /*
+             * 只收真正带 URI 的密钥。
+             *
+             * `METHOD=NONE` 表示这一段不加密，没有 URI；
+             * 而部分编码器会在**每个分片前重复输出同一个 KEY 行**，
+             * 不去重的话同一个密钥会被下载多次、`total` 也被重复计数，
+             * 进度百分比随之失真（分母虚大、永远到不了 100%）。
+             */
             const m = line.match(/URI="([^"]+)"/);
-            if (m) keys.push(absolutize(m[1], baseUrl));
+            if (m) {
+                const u = absolutize(m[1], baseUrl);
+                if (!keys.includes(u)) keys.push(u);
+            }
             continue;
         }
         if (line.startsWith('#EXT-X-MAP:')) {
             const m = line.match(/URI="([^"]+)"/);
-            if (m) maps.push(absolutize(m[1], baseUrl));
+            if (m) {
+                const u = absolutize(m[1], baseUrl);
+                if (!maps.includes(u)) maps.push(u);
+            }
             continue;
         }
         // 其它 # 开头的都是标签，非 URI 行
         if (line.startsWith('#')) continue;
-        segments.push(absolutize(line, baseUrl));
+
+        const u = absolutize(line, baseUrl);
+        if (seen.has(u)) continue;
+        seen.add(u);
+        segments.push(u);
     }
 
     return { segments, keys, maps, duration };
@@ -228,22 +279,44 @@ function ensureDir(key: string): Promise<any> {
     );
 }
 
-/** 把临时文件复制进缓存目录，命名为 `<name>`。 */
+/**
+ * 把临时文件复制进缓存目录，命名为 `<name>`。
+ *
+ * ⚠️ 覆盖写：`copyTo` 在目标已存在时**会失败**（不同机型报错不一，
+ * 有的是「文件已存在」有的是静默不覆盖）。而以下场景必然命中已存在：
+ *   · 重试一次失败的分片（downloadWithRetry 的第二次尝试）
+ *   · 取消后重新开始缓存同一集（注释里说「同名文件会被覆盖」，实际不会）
+ * 故这里先删除同名目标文件，再复制 —— 保证「重试即覆盖」成立。
+ *
+ * 删除失败（文件本就不存在是最常见的情况）直接忽略，不影响后续复制。
+ */
 function copyInto(dirEntry: any, tempPath: string, name: string): Promise<number> {
     return resolveEntry(tempPath).then(
         (srcEntry: any) =>
             new Promise<number>((resolve, reject) => {
-                srcEntry.copyTo(
-                    dirEntry,
+                const doCopy = () => {
+                    srcEntry.copyTo(
+                        dirEntry,
+                        name,
+                        (entry: any) => {
+                            // 顺带取文件大小，用于统计已用空间
+                            entry.getMetadata(
+                                (meta: any) => resolve(Number(meta.size) || 0),
+                                () => resolve(0)
+                            );
+                        },
+                        reject
+                    );
+                };
+
+                // 先尝试删掉同名旧文件（不存在时回调失败，忽略即可）
+                dirEntry.getFile(
                     name,
-                    (entry: any) => {
-                        // 顺带取文件大小，用于统计已用空间
-                        entry.getMetadata(
-                            (meta: any) => resolve(Number(meta.size) || 0),
-                            () => resolve(0)
-                        );
+                    { create: false },
+                    (old: any) => {
+                        old.remove(doCopy, doCopy);
                     },
-                    reject
+                    doCopy
                 );
             })
     );
@@ -378,8 +451,23 @@ export function cacheDirOf(key: string): string {
     return `_doc/${CACHE_DIR}/${key}/`;
 }
 
-/** 删除某集缓存（文件 + 记录 + 索引）。 */
+/**
+ * 删除某集缓存（文件 + 记录 + 索引）。
+ *
+ * ⚠️ 必须先取消正在进行的下载任务。
+ *
+ * 否则会出现「删了又回来」：删除只清了文件与记录，但下载任务还在跑，
+ * 它下一次 persist() 会按内存里的 item 把记录**重新写回**列表，
+ * 用户刷新后看到条目还在（点进去才发现文件已没了）。
+ * 同时任务仍在往已删除的目录里写文件，会持续报错刷日志。
+ */
 export async function removeCache(key: string): Promise<void> {
+    // 先停任务，并给它一点时间退出循环（避免边删边写）
+    cancelDownload(key);
+    if (running.has(key)) {
+        await new Promise(r => setTimeout(r, 120));
+    }
+
     await removeLocalDir(key);
     try {
         uni.removeStorageSync(`${MANIFEST_PREFIX}${key}`);
@@ -389,9 +477,22 @@ export async function removeCache(key: string): Promise<void> {
     }
 }
 
-/** 清空全部缓存。 */
+/**
+ * 清空全部缓存。
+ *
+ * 先统一取消所有在跑的任务再逐个删除 —— 理由同 removeCache，
+ * 不先停会让清空操作和在跑任务互相打架（记录被写回、文件删不干净）。
+ */
 export async function clearAllCache(): Promise<void> {
     const list = getCacheList();
+    for (const item of list) {
+        cancelDownload(item.key);
+    }
+    // 等各任务退出循环后再动手删，避免「删到一半又被写入」
+    if (running.size > 0) {
+        await new Promise(r => setTimeout(r, 200));
+    }
+
     for (const item of list) {
         await removeCache(item.key);
     }
@@ -440,23 +541,46 @@ function fetchText(url: string): Promise<string> {
     });
 }
 
-/** 下载单个资源到本地文件，返回落盘字节数。 */
+/**
+ * 下载单个资源到本地文件，返回落盘字节数。
+ *
+ * 自带超时兜底：`uni.downloadFile` 的 timeout 在部分 Android 机型上
+ * 并不可靠，而本工程的片源单集动辄上千个分片 —— 只要有一个请求挂住
+ * 不回调（既 success 也 fail 都不来），runPool 的 Promise 就永远不 settle，
+ * 整个缓存任务卡在「缓存中…」且无法自行结束。
+ *
+ * 因此这里再包一层定时器：超时后主动 reject，让并发池继续推进。
+ * 注意**只能 reject 一次**，故用 settled 标记防止重复决议。
+ */
 function downloadToFile(url: string, dirEntry: any, name: string): Promise<number> {
     return new Promise((resolve, reject) => {
-        const task = uni.downloadFile({
+        let settled = false;
+        const finish = (fn: () => void) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            fn();
+        };
+
+        const timer = setTimeout(() => {
+            finish(() => reject(new Error('下载超时')));
+        }, DOWNLOAD_TIMEOUT);
+
+        uni.downloadFile({
             url,
-            timeout: 60000,
+            timeout: DOWNLOAD_TIMEOUT,
             success: res => {
                 if (res.statusCode !== 200 || !res.tempFilePath) {
-                    reject(new Error(`HTTP ${res.statusCode}`));
+                    finish(() => reject(new Error(`HTTP ${res.statusCode}`)));
                     return;
                 }
-                copyInto(dirEntry, res.tempFilePath, name).then(resolve, reject);
+                copyInto(dirEntry, res.tempFilePath, name).then(
+                    n => finish(() => resolve(n)),
+                    e => finish(() => reject(e as Error))
+                );
             },
-            fail: err => reject(new Error(JSON.stringify(err)))
+            fail: err => finish(() => reject(new Error(JSON.stringify(err))))
         });
-        // 超时保护：避免个别分片卡死导致整集任务不结束
-        void task;
     });
 }
 
@@ -542,6 +666,29 @@ export async function startCache(options: StartCacheOptions): Promise<CacheItem>
     };
     upsertItem(item);
 
+    /**
+     * 进度落盘的节流器。
+     *
+     * 为什么必须节流：实测本项目的片源**单集可达 2142 个分片**
+     * （约 1.4GB / 107 分钟）。原实现「每个分片完成都 upsertItem」，
+     * 等于 2142 次「读全量列表 → 同步写存储」。
+     * `uni.setStorageSync` 是**同步磁盘写**，在下载这种高频回调里
+     * 会明显拖慢任务、并让 UI 频繁卡顿。
+     *
+     * 这里改为：进度照常累加（内存中的 item 始终准确），
+     * 但落盘最多每 PROGRESS_FLUSH_MS 一次；收尾时再强制flush一次，
+     * 保证最终状态一定写进去。
+     */
+    let lastFlush = 0;
+    const persist = (force = false) => {
+        const now = Date.now();
+        if (!force && now - lastFlush < PROGRESS_FLUSH_MS) return;
+        lastFlush = now;
+        item.updatedAt = now;
+        upsertItem(item);
+        options.onProgress?.({ ...item });
+    };
+
     try {
         // 1. 拉取并解析索引（走原始地址，不走 H5 代理）
         const rawUrl = unwrapUrl(options.m3u8Url);
@@ -556,30 +703,41 @@ export async function startCache(options: StartCacheOptions): Promise<CacheItem>
 
         item.total = parsed.segments.length + parsed.keys.length + parsed.maps.length;
         item.duration = Math.round(parsed.duration);
-        upsertItem(item);
-        options.onProgress?.({ ...item });
+        // 分片总数是「必须立刻让界面看到」的信息（进度分母），故强制落盘
+        persist(true);
 
         const dirEntry = await ensureDir(key);
 
-        // 2. 密钥与初始化段（数量很少，直接跟着一起下）
+        /*
+         * 2. 密钥与初始化段。
+         *
+         * ⚠️ 文件名**必须**用 localFileNameOf（URL 哈希），不能自定义
+         * `key_0.bin` / `init_0.mp4` 之类的好看名字 ——
+         * 离线播放时 hls.js 会拿着索引里的原始 URL 来请求这两类资源，
+         * 播放器的本地查找规则是「URL 哈希 + 扩展名」（见 yh-player 的
+         * localFileNameOf），自定义名字永远命中不了。
+         *
+         * 后果很隐蔽：不加密的 TS 片源完全正常，因此平时测不出来；
+         * 一旦遇到 AES-128 或 fMP4 片源，离线播放就必然黑屏 / 解密失败。
+         * 这里统一走同一套命名规则，让播放器能按哈希找到。
+         */
         const extras: Array<{ url: string; name: string }> = [
-            ...parsed.keys.map((u, i) => ({ url: u, name: `key_${i}.bin` })),
-            ...parsed.maps.map((u, i) => ({ url: u, name: `init_${i}.mp4` }))
+            ...parsed.keys.map(u => ({ url: u, name: localFileNameOf(u) })),
+            ...parsed.maps.map(u => ({ url: u, name: localFileNameOf(u) }))
         ];
         let failed = 0;
         for (const ex of extras) {
             if (flag.cancelled) break;
             try {
-                item.bytes += await downloadWithRetry(ex.url, dirEntry, ex.name);
+                const n = await downloadWithRetry(ex.url, dirEntry, ex.name);
+                item.bytes += n;
                 item.done += 1;
             } catch (e) {
                 // 失败不计入 done，否则百分比会虚高、也看不出完整性
                 failed += 1;
                 log.warn('附加资源下载失败', ex.url, String(e));
             }
-            item.updatedAt = Date.now();
-            upsertItem(item);
-            options.onProgress?.({ ...item });
+            persist();
         }
 
         // 3. 分片：并发下载，文件名由 URL 哈希决定（播放时按同样规则定位）
@@ -589,15 +747,27 @@ export async function startCache(options: StartCacheOptions): Promise<CacheItem>
             async url => {
                 const name = localFileNameOf(url);
                 try {
-                    item.bytes += await downloadWithRetry(url, dirEntry, name);
+                    /*
+                     * ⚠️ 必须先 await 拿到结果，再同步累加。
+                     *
+                     * 不能写成 `item.bytes += await download(...)` ——
+                     * 那个形式是「读 item.bytes → await → 写回」，
+                     * 而 await 期间其它并发分片会同样读到**同一个旧值**，
+                     * 各自加完再写回，互相覆盖。
+                     *
+                     * 实测（3 个分片、100+200+300 字节）：写成 += await 时
+                     * 最终只记到 300，**丢失一半**。这里的分片动辄数千个，
+                     * 丢失量会让「已用空间」远小于实际占用，
+                     * 用户看到的体积是错的，也据此判断不出磁盘够不够。
+                     */
+                    const n = await downloadWithRetry(url, dirEntry, name);
+                    item.bytes += n;
                     item.done += 1;
                 } catch (e) {
                     failed += 1;
                     log.warn('分片下载失败', url, String(e));
                 }
-                item.updatedAt = Date.now();
-                upsertItem(item);
-                options.onProgress?.({ ...item });
+                persist();
             },
             () => flag.cancelled
         );
@@ -618,8 +788,8 @@ export async function startCache(options: StartCacheOptions): Promise<CacheItem>
         } else {
             item.status = 'done';
         }
-        item.updatedAt = Date.now();
-        upsertItem(item);
+        // 终态强制落盘：节流可能刚跳过最后一次写入，这里必须补上
+        persist(true);
 
         log.info(
             '缓存结束',
@@ -632,8 +802,7 @@ export async function startCache(options: StartCacheOptions): Promise<CacheItem>
     } catch (e) {
         item.status = 'error';
         item.error = (e as Error)?.message || '下载失败';
-        item.updatedAt = Date.now();
-        upsertItem(item);
+        persist(true);
         log.error('缓存失败', key, item.error);
         return item;
     } finally {

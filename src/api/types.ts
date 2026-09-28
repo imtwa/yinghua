@@ -42,6 +42,8 @@ export interface Vod {
     vod_remarks: string;
     vod_score: string;
     vod_content: string;
+    /** 导演（苹果CMS 的 vod_director） */
+    vod_director: string;
     vod_total: number;
     type_pid: number;
     vod_collection?: Collection[];

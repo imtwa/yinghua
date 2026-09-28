@@ -68,6 +68,7 @@ function asVod(item: FavoriteItem): Vod {
         vod_remarks: item.vodRemarks,
         vod_score: '',
         vod_content: '',
+        vod_director: '',
         vod_total: 0,
         type_pid: 0
     };

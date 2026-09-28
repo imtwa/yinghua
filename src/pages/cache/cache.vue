@@ -234,10 +234,6 @@ onUnload(() => {
         ticker = null;
     }
 });
-
-// startCache / isDownloading 由播放页使用，这里保留引用以便后续扩展「重试」用
-void startCache;
-void isDownloading;
 </script>
 
 <style lang="scss" scoped>

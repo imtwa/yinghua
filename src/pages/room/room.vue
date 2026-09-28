@@ -26,6 +26,7 @@
                 @play="onHostPlay"
                 @pause="onHostPause"
                 @seeked="onHostSeek"
+                @error="onPlayError"
                 @ended="onEnded" />
 
             <view v-else class="room__loading">
@@ -58,10 +59,20 @@
             那是 renderjs 组件，卸载等于挂断通话。
             这里只切 CSS（display:none），组件保持挂载、通话不断。
         -->
+        <!--
+            通话悬浮窗。
+
+            **组件的挂载不再依赖「是否开启通话」**（见下方说明）：
+            yh-rtc 从进房间起就常驻，因为房间同步的 dataChannel 挂在它上面。
+            浮层的外观只由 pipPlaced + callEnabled 控制。
+
+            注意 v-show 而非 v-if：
+            用 v-if 会卸载 renderjs 组件 = 挂断通话，房间同步随之断掉。
+        -->
         <view
-            v-if="callEnabled && pipPlaced"
+            v-show="pipPlaced"
             class="room__pip"
-            :class="{ 'room__pip--mini': pipMini }"
+            :class="{ 'room__pip--mini': pipMini, 'room__pip--hidden': !callEnabled }"
             :style="pipStyle"
             @touchstart="onPipTouchStart"
             @touchmove.stop.prevent="onPipTouchMove"
@@ -74,12 +85,16 @@
                 :room-id="roomId"
                 :display-name="displayName"
                 :auto-start="true"
+                :media-on="callEnabled"
                 @status="onCallStatus"
                 @remote="onRemoteChange"
                 @peers="onPeersChange"
                 @peername="onPeerName"
                 @message="onChannelMessage"
+                @channel="onChannelOpen"
                 @localready="onLocalReady"
+                @mediaerror="onMediaError"
+                @broadcastfail="onBroadcastFail"
                 @error="onCallError" />
 
             <!--
@@ -226,8 +241,8 @@
                 <view class="room__chip" :class="{ 'room__chip--accent': isHost, 'room__chip--warn': !isHost && !following }">
                     <text class="room__chip-text">{{ isHost ? '同步广播中' : following ? '跟随中' : '已取消跟随' }}</text>
                 </view>
-                <view class="room__chip" :class="{ 'room__chip--warn': callEnabled && callStatus === 'error' }">
-                    <text class="room__chip-text">{{ callEnabled ? statusText : '通话未开启' }}</text>
+                <view class="room__chip" :class="{ 'room__chip--warn': callStatus === 'error' }">
+                    <text class="room__chip-text">{{ statusText }}</text>
                 </view>
                 <view class="room__chip">
                     <text class="room__chip-text">{{ playbackRate }}×</text>
@@ -237,6 +252,25 @@
             <!-- 同步状态提示 -->
             <view v-if="!isHost && syncHint" class="room__hint">
                 <text class="room__hint-text">{{ syncHint }}</text>
+            </view>
+
+            <!--
+                房间同步未建立的提示（房主侧）。
+                房主以为一切正常、观众却在干等，是最难自查的故障 ——
+                把「消息发不出去」直接说出来，用户能立刻意识到是通话没连上。
+            -->
+            <view v-if="isHost && syncBroken && callEnabled" class="room__hint room__hint--warn">
+                <text class="room__hint-text">
+                    房间同步未建立：对方还没接入通话。请让对方用同一房间号加入。
+                </text>
+            </view>
+
+            <!-- 摄像头/麦克风不可用：不影响看片同步，故单独提示并提供重试 -->
+            <view v-if="callEnabled && rtcMediaError" class="room__hint room__hint--warn">
+                <text class="room__hint-text">{{ rtcMediaError }}</text>
+                <view class="room__hint-btn tap tap-solid" @click="retryMedia">
+                    <text class="room__hint-btn-text">重试摄像头</text>
+                </view>
             </view>
 
             <view class="room__actions">
@@ -633,6 +667,18 @@ function expandPip() {
 /** 本地画面是否就绪（用于判断能否广播片源） */
 const localReady = ref(false);
 
+/**
+ * 房间同步是否未建立（房主侧）。
+ *
+ * 由 rtc 的 broadcastfail 事件点亮、由 peers 事件熄灭。
+ * 有了它，「观众一直等待房主选片」这类故障在房主侧也能被看见 ——
+ * 否则房主看到自己的画面一切正常，完全想不到消息根本没发出去。
+ */
+const syncBroken = ref(false);
+
+/** 摄像头/麦克风的失败原因（空串表示正常） */
+const rtcMediaError = ref('');
+
 const collections = ref<Collection[]>([]);
 const currentIndex = ref(0);
 const vodId = ref(0);
@@ -705,11 +751,15 @@ let broadcastTimer: any = null;
 /** 显示名：用本地昵称，随信令 metadata 发给对端。 */
 const displayName = computed(() => userStore.nickname || '观影人');
 
-/** 通话状态文案。 */
+/**
+ * 连接状态文案。
+ *
+ * 注意这里描述的是**信令与房间同步**的状态，与「有没有开摄像头」无关 ——
+ * 信令随进房间即建立，因此「未开始」只应出现在信令尚未连上时。
+ */
 const statusText = computed(() => {
-    if (!callEnabled.value) return '未开始';
-    if (callStatus.value === 'connecting') return '连接中…';
     if (callStatus.value === 'error') return '连接异常';
+    if (callStatus.value === 'connecting' || callStatus.value === 'idle') return '连接中…';
     return hasRemote.value ? '对方已接入' : '等待对方接入';
 });
 
@@ -911,8 +961,14 @@ function onTimeUpdate(payload: { currentTime: number }) {
  *
  * 走统一的 switchToEpisode —— 它会顺带广播给观众，
  * 早先这里只改本地下标，观众不会跟着切。
+ *
+ * ⚠️ 只有房主能触发自动续集。观众侧播完若也调用，会自己切集
+ * 并把 episode 广播出去，与房主的切集指令互相覆盖 ——
+ * 两端各自往前跳一集，越跑越偏。
+ * 观众的正确行为是等房主切（房主切完会广播新的 source）。
  */
 function onEnded() {
+    if (!isHost.value) return;
     const next = currentIndex.value + 1;
     if (next < collections.value.length) switchToEpisode(next);
 }
@@ -924,13 +980,20 @@ function onEnded() {
  *
  * 早先只靠 3 秒轮播，观众最多要等 3 秒才跟上；
  * 暂停更是完全同步不了（广播里 playing 被写死为 true）。
+ *
+ * ⚠️ 必须拦观众：观众侧的 play 事件是**响应房主指令**产生的，
+ * 若也走 syncNow 发出 state，就会与房主的广播来回反弹
+ * （房主播→观众播→观众广播→房主收到但不跟随→…），
+ * 在弱网下表现为进度持续抖动、两端互相 seek。
  */
 function onHostPlay() {
+    if (!isHost.value) return;
     syncNow();
 }
 
 /** 房主暂停 → 立刻广播，让观众一起停下。 */
 function onHostPause() {
+    if (!isHost.value) return;
     syncNow();
 }
 
@@ -947,19 +1010,71 @@ function onHostSeek(target: number) {
     broadcastState(state);
 }
 
+/** 播放出错：先看播放器是否在自愈，再决定换线路还是重新解析。 */
+async function onPlayError(err: any) {
+    log.error('播放出错', JSON.stringify(err), '当前地址', playStore.playUrl);
+
+    /*
+     * 播放器正在原地重试（网络抖动、坏分片）。
+     *
+     * 此时**不要**抢着换线路：播放器的重载往往几百毫秒就恢复，
+     * 父页面一换线路等于把正在恢复的流又打断一次，两边互相拆台。
+     */
+    if (err && err.retrying) {
+        log.info('播放器正在原地重试，暂不切换线路');
+        return;
+    }
+
+    /*
+     * 换线路。
+     *
+     * 观众侧**不能**自行换：片源地址是由房主同步过来的，
+     * 观众私下换一条地址会与房主的进度基准错位。
+     * 观众的正确做法是等下一次 source 同步。
+     */
+    if (!isHost.value) {
+        log.warn('观众侧播放失败，等待房主重新同步片源');
+        return;
+    }
+
+    if (playStore.switchToBackup()) {
+        log.info('已切换备用线路', playStore.playUrl);
+        return;
+    }
+
+    // 线路用尽：重新解析一次（可能拿到新的 CDN 地址）
+    await resolve();
+    // 重新解析完立刻把新地址推给观众，否则两端会不同步
+    pushSource();
+}
+
 /* ---------------- 通话 ---------------- */
 
+/**
+ * 开启视频通话。
+ *
+ * **只负责开关媒体** —— 信令早已随组件挂载建立（见 onLoad 与模板注释）。
+ * 早先这里等于「整个通话组件的挂载开关」，导致不开通话就收不到
+ * 房主的片源同步；现在两者已彻底解耦。
+ */
 function startCall() {
     callEnabled.value = true;
 }
 
+/**
+ * 关闭视频通话（释放摄像头/麦克风）。
+ *
+ * **只关媒体**：信令与 PeerConnection 保持，房间同步继续工作。
+ *
+ * 因此这里**不能**重置 callStatus / hasRemote —— 那两个反映的是
+ * 「信令是否连上」「对方是否在房间里」，关摄像头并不改变它们。
+ * 早先一并清掉，会让状态条显示成「连接中…」甚至「等待对方接入」，
+ * 明明对方还在房间里、片源同步也照常。
+ */
 function endCall() {
-    rtcRef.value?.destroy?.();
+    rtcRef.value?.stopMedia?.();
     callEnabled.value = false;
-    hasRemote.value = false;
-    callStatus.value = 'idle';
     localReady.value = false;
-    stopBroadcast();
 }
 
 /**
@@ -973,10 +1088,63 @@ function onPeerName(payload: { id: string; name: string }) {
     if (payload && payload.name) log.info('对端昵称', payload.name);
 }
 
-/** 本地画面就绪：房主此时才开始广播（否则观众拿到空的片源信息）。 */
-function onLocalReady(_info: any) {
-    localReady.value = true;
-    if (isHost.value) startBroadcast();
+/**
+ * 数据通道打开。
+ *
+ * 这是「房间同步真正可用」的准确时机 —— 比 connectionState==='connected'
+ * 更早也更可靠：PeerConnection 连上时 dataChannel 可能仍在协商，
+ * 此刻发消息会被静默丢弃。通道一 open 就立刻推一次片源，
+ * 观众不必等下一个 3 秒轮播周期。
+ */
+function onChannelOpen() {
+    log.info('同步通道已打开');
+    syncBroken.value = false;
+    if (isHost.value) {
+        startBroadcast();
+        // 立即推一次，让刚进来的观众马上拿到片源
+        pushSource();
+    }
+}
+
+/** 本地媒体就绪（false 表示摄像头不可用，但不影响房间同步）。 */
+function onLocalReady(info: any) {
+    localReady.value = !!(info && info.media);
+}
+
+/**
+ * 摄像头/麦克风不可用。
+ *
+ * 与通话故障分开处理：此时信令与看片同步都正常，只是没有画面，
+ * 因此提示要写清「不影响看片」，并给出重试入口。
+ */
+function onMediaError(e: any) {
+    rtcMediaError.value = (e && e.message) || '无法访问摄像头';
+    log.warn('媒体不可用', rtcMediaError.value);
+}
+
+/**
+ * 房主广播失败：房间同步未建立。
+ *
+ * 判定要**排除「本来就没人进来」这种正常情况**：
+ * 房主刚进房间时必然没有对端，此时每次轮播都会失败，
+ * 若照样报警就会一直挂着一句「同步未建立」，让人误以为出了故障。
+ *
+ * 因此只在「已有对端、但消息仍发不出去」时才提示 ——
+ * 那才是真正需要排查的状态（协商卡住、dataChannel 没打开）。
+ */
+function onBroadcastFail(e: any) {
+    if (!isHost.value) return;
+    // 没人接入属于正常，不提示
+    if (peerCount.value === 0 && !hasRemote.value) return;
+    if (syncBroken.value) return;
+    syncBroken.value = true;
+    log.warn('广播失败，房间同步未建立', (e && e.reason) || '');
+}
+
+/** 重试获取摄像头/麦克风（用户去系统设置放开权限后回来用）。 */
+function retryMedia() {
+    rtcMediaError.value = '';
+    rtcRef.value?.retryMedia?.();
 }
 
 /**
@@ -987,6 +1155,8 @@ function onLocalReady(_info: any) {
 function onPeersChange(payload: { count: number; names: string[] }) {
     peerCount.value = Number(payload?.count) || 0;
     peerNames.value = Array.isArray(payload?.names) ? payload.names : [];
+    // 有对端连上说明同步通道可用，撤掉「未建立」提示
+    if (peerCount.value > 0) syncBroken.value = false;
 }
 
 /**
@@ -1007,12 +1177,28 @@ function onRateChange(rate: number) {
 
 function onCallStatus(s: 'idle' | 'connecting' | 'connected' | 'error') {
     callStatus.value = s;
+
+    /*
+     * 房主广播由**信令连接成功**驱动，而不是「本地摄像头就绪」。
+     *
+     * 这是「观众一直显示等待房主选片」的直接修复点：
+     * 早先只在 onLocalReady（取流成功）里启动广播，摄像头一旦失败，
+     * 广播永远不会开始 —— 而房间同步其实只需要信令与 dataChannel，
+     * 跟摄像头毫无关系。
+     */
+    if (s === 'connected' && isHost.value) {
+        startBroadcast();
+        // 信令通了就重新评估同步状态（真正的判据是有没有对端）
+        if (peerCount.value > 0) syncBroken.value = false;
+    }
 }
 
 function onRemoteChange(on: boolean) {
     hasRemote.value = on;
     if (on) {
         log.info('对方已接入通话');
+        // 有人进来了，同步通道可用，撤掉「未建立」提示
+        syncBroken.value = false;
         // 房主在对方接入后立刻推一次片源，观众无需等待下一个广播周期
         if (isHost.value) startBroadcast();
     }
@@ -1377,28 +1563,28 @@ onLoad(options => {
 });
 
 /**
- * 页面隐藏时挂断。
+ * 页面隐藏时释放摄像头。
  *
- * 必须同时关掉悬浮窗（callEnabled=false），否则回到前台会看到
- * 一个「还在但已断开」的窗口，用户点屏幕没有任何反应。
- * 摄像头/麦克风也必须在后台释放，避免长期占用与耗电。
+ * **只停媒体，不停信令。**
+ *
+ * 早先这里调 destroy 把整个通话组件清掉 —— 那会连同信令一起断开，
+ * 于是「房主切后台看一眼消息」就导致房间同步中断、观众掉线。
+ * 现在信令常驻（房间同步依赖它），切后台只释放摄像头/麦克风，
+ * 避免长期占用与耗电。
  *
  * **例外：房主去选片页时要放行。**
  * onHide 对「切后台」与「页内跳转」一视同仁，而跳去选片页
- * 只是把新页面压栈、房间页仍在栈里活着。若无条件销毁通话，
- * 房主一进选片页通话就断，观众被晾在原地 ——
- * 这正是「换片必须重开房间」的根因。
+ * 只是把新页面压栈、房间页仍在栈里活着。若无条件停媒体，
+ * 房主一进选片页通话画面就断，观众被晾在原地。
  */
 onHide(() => {
     if (pickingVideo.value) return;
 
     if (callEnabled.value) {
-        rtcRef.value?.destroy?.();
+        // 只释放设备；信令与房间同步不受影响（故不动 callStatus / hasRemote）
+        rtcRef.value?.stopMedia?.();
         callEnabled.value = false;
-        hasRemote.value = false;
-        callStatus.value = 'idle';
         localReady.value = false;
-        stopBroadcast();
     }
 });
 
@@ -1566,6 +1752,18 @@ onUnload(() => {
 
     &__pip--mini .room__rtc,
     &__pip--mini .room__pip-acts {
+        display: none;
+    }
+
+    /*
+     * 未开启通话：整个浮窗隐藏（但组件**保持挂载**）。
+     *
+     * 用 display:none 而不是 v-if —— yh-rtc 是 renderjs 组件，
+     * 卸载就等于销毁信令连接，房间同步（片源/进度/选集）会一起断掉。
+     * display:none 下 DOM 与连接都还在，只是不显示，
+     * 因此「不开摄像头也照样能同步看片」。
+     */
+    &__pip--hidden {
         display: none;
     }
 
@@ -1952,6 +2150,13 @@ onUnload(() => {
         color: #9aa3af;
     }
 
+    /*
+     * 提示条。
+     *
+     * 普通态是橙色短句（如「已对齐到 120 秒」），走小字不加底；
+     * 警示态加淡红底与内边距 —— 它承载的是「同步未建立」「摄像头不可用」
+     * 这类需要用户动手处理的信息，与一闪而过的同步提示区分开。
+     */
     &__hint {
         margin-top: 20rpx;
     }
@@ -1959,6 +2164,37 @@ onUnload(() => {
     &__hint-text {
         font-size: 24rpx;
         color: #f0a63c;
+    }
+
+    &__hint--warn {
+        display: flex;
+        align-items: center;
+        padding: 16rpx 20rpx;
+        border-radius: 12rpx;
+        background-color: rgba(217, 139, 133, 0.12);
+    }
+
+    &__hint--warn &__hint-text {
+        flex: 1;
+        min-width: 0;
+        font-size: 23rpx;
+        line-height: 1.5;
+        color: #d98b85;
+    }
+
+    /* 提示条内的行动按钮：紧凑、不抢主按钮的视觉重量 */
+    &__hint-btn {
+        flex-shrink: 0;
+        margin-left: 16rpx;
+        padding: 8rpx 22rpx;
+        border-radius: 999rpx;
+        background-color: rgba(240, 166, 60, 0.16);
+    }
+
+    &__hint-btn-text {
+        font-size: 22rpx;
+        color: #f0a63c;
+        white-space: nowrap;
     }
 
     &__actions {

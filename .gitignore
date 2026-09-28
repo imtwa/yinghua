@@ -40,6 +40,8 @@ vite.config.ts.timestamp-*.mjs
 
 # 本地环境覆盖
 env/.env.local
+# 本地开发证书（含私钥，绝不入库）
+env/certs/
 
 # 自动生成
 src/types/auto-import.d.ts

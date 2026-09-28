@@ -22,6 +22,7 @@
         "prepare": "pnpm init-husky",
         "init-husky": "git init && husky",
         "gen:icons": "node ./scripts/gen-icons.mjs",
+        "dev:cert": "node ./scripts/dev-cert.mjs",
         "predev": "node ./scripts/create-base-files.js",
         "predev:app": "node ./scripts/create-base-files.js",
         "prebuild:app": "node ./scripts/gen-icons.mjs && node ./scripts/create-base-files.js",

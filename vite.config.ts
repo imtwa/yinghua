@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs';
 import process from 'node:process';
 import Uni from '@uni-helper/plugin-uni';
 import UniComponents from '@uni-helper/vite-plugin-uni-components';
@@ -25,6 +26,35 @@ import ViteRestart from 'vite-plugin-restart';
 import { createProxy } from './vite-plugins/proxy';
 import { createH5CorsProxy } from './vite-plugins/h5-cors-proxy';
 
+/**
+ * 读取本地开发证书（若存在）。
+ *
+ * ## 为什么开发服务器要上 https
+ *
+ * 浏览器的安全上下文规则：**只有 https / localhost / 127.0.0.1 下
+ * `navigator.mediaDevices` 才存在**。手机连同一 WiFi 用
+ * `http://192.168.x.x:9010` 调试时它是 `undefined`，
+ * 房间通话的摄像头/麦克风必然拿不到 —— 而用户看到的只是
+ * 「点了没反应」，很容易误判成代码 bug。
+ *
+ * 证书由 `pnpm dev:cert` 生成（见 scripts/dev-cert.mjs），
+ * 落在 env/certs 下。**不存在时静默退回 http**，
+ * 不强制所有人装 mkcert —— 只调播放、不需要通话时用 http 就够了。
+ */
+function readDevCert() {
+    const dir = path.resolve(process.cwd(), 'env/certs');
+    const key = path.join(dir, 'dev-key.pem');
+    const cert = path.join(dir, 'dev-cert.pem');
+    try {
+        if (fs.existsSync(key) && fs.existsSync(cert)) {
+            return { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
+        }
+    } catch {
+        /* 读失败按无证书处理 */
+    }
+    return null;
+}
+
 // https://vitejs.dev/config/
 export default defineConfig(({ command, mode }) => {
     const { UNI_PLATFORM } = process.env;
@@ -36,6 +66,14 @@ export default defineConfig(({ command, mode }) => {
 
     // H5 dev 走 devServer 代理绕开跨域；App / 生产直连接口域名。
     const proxyEnabled = VITE_APP_PROXY_ENABLE === 'true' && UNI_PLATFORM === 'h5' && command === 'serve';
+
+    // 仅 H5 开发期使用；证书不存在时为 null，走普通 http
+    const devCert = UNI_PLATFORM === 'h5' && command === 'serve' ? readDevCert() : null;
+    if (UNI_PLATFORM === 'h5' && command === 'serve') {
+        console.log(devCert
+            ? 'H5 dev https -> 已启用（证书来自 env/certs）'
+            : 'H5 dev https -> 未启用（运行 pnpm dev:cert 可生成证书，通话需要 https）');
+    }
 
     return defineConfig({
         // 自定义 env 目录
@@ -127,6 +165,8 @@ export default defineConfig(({ command, mode }) => {
             host: '0.0.0.0',
             hmr: true,
             port: Number.parseInt(VITE_APP_PORT, 10),
+            // 有证书则上 https（通话必需），否则退回 http
+            https: devCert || undefined,
             // 仅 H5 端生效（其他端走 build，不走 devServer）
             proxy: proxyEnabled
                 ? createProxy({

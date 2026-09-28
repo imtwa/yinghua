@@ -1,5 +1,5 @@
 <template>
-    <view class="vod-card tap" @click="onClick">
+    <view class="vod-card tap" :class="{ 'vod-card--horizontal': horizontal }" @click="onClick">
         <view class="vod-card__poster">
             <image class="vod-card__img" :src="vod.vod_pic" mode="aspectFill" lazy-load />
             <view v-if="vod.vod_remarks" class="vod-card__badge">
@@ -66,6 +66,17 @@ function onClick() {
         border-radius: 12rpx;
         overflow: hidden;
         background-color: #1d2128;
+    }
+
+    /*
+     * 横版：16:9（padding-top 用高/宽百分比 56.25%）。
+     *
+     * 属性 horizontal 此前只是个摆设 —— 声明了、注释也写了「横版 16:9」，
+     * 但样式里 133% 是写死的，传了也不生效。
+     * 这里补上对应的修饰类，让该属性真正可用。
+     */
+    &--horizontal &__poster {
+        padding-top: 56.25%;
     }
 
     &__img {

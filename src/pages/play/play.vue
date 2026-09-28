@@ -29,10 +29,21 @@
                     @error="onPlayError" />
 
                 <view v-else class="play__loading">
-                    <text class="play__loading-text">{{ loadingText }}</text>
-                    <text v-if="status === 'error' && failReason" class="play__reason">{{ failReason }}</text>
-                    <view v-if="status === 'error'" class="play__retry tap tap-solid" @click="reload">
-                        <text class="play__retry-text">重新加载</text>
+                    <!--
+                        首屏海报做背景：加载期给用户一个「在看哪部片」的锚点，
+                        纯黑底 + 一行灰字会让人怀疑是不是卡住了。
+                        压暗处理，避免与前景文案抢视线。
+                    -->
+                    <image v-if="poster" class="play__loading-bg" :src="poster" mode="aspectFill" />
+                    <view class="play__loading-mask" />
+
+                    <view class="play__loading-body">
+                        <view v-if="status !== 'error'" class="play__loading-spin" />
+                        <text class="play__loading-text">{{ loadingText }}</text>
+                        <text v-if="status === 'error' && failReason" class="play__reason">{{ failReason }}</text>
+                        <view v-if="status === 'error'" class="play__retry tap tap-solid" @click="reload">
+                            <text class="play__retry-text">重新加载</text>
+                        </view>
                     </view>
                 </view>
             </view>
@@ -60,9 +71,26 @@
                             {{ cacheText }}
                         </text>
                     </view>
+                    <!-- 下载成 MP4：仅 App 端可用（依赖 Native.js 写盘） -->
+                    <view v-if="cacheSupported" class="play__action tap tap-solid" @click="onExportTap">
+                        <text class="play__action-text" :class="{ 'play__action-text--busy': exporting }">
+                            {{ exportText }}
+                        </text>
+                    </view>
                     <view v-if="playStore.backups.length" class="play__action tap tap-solid" @click="switchLine">
                         <text class="play__action-text">切换线路</text>
                     </view>
+                </view>
+
+                <!-- MP4 导出进度 -->
+                <view v-if="exporting" class="play__cache">
+                    <view class="play__cache-bar">
+                        <view class="play__cache-fill" :style="{ width: exportPercent + '%' }" />
+                    </view>
+                    <text class="play__cache-text">
+                        正在导出 MP4 {{ exportPercent }}% · {{ formatSize(exportBytes) }}
+                        <text v-if="exportTotal">（{{ exportDone }}/{{ exportTotal }} 片）</text>
+                    </text>
                 </view>
 
                 <!-- 缓存进度条：下载中才显示 -->
@@ -93,6 +121,21 @@
 
             <view class="play__tail" />
         </scroll-view>
+
+        <!--
+            MP4 导出服务组件（无 UI）。
+            常驻挂载：它是纯服务型组件，渲染层要提前加载 mux.js，
+            等用户点「下载 MP4」时再挂载会多一次冷启动等待。
+        -->
+        <yh-exporter
+            ref="exporterRef"
+            :m3u8-url="currentRawUrl"
+            :vod-name="vodName"
+            :episode-title="episodeTitle"
+            @progress="onExportProgress"
+            @done="onExportDone"
+            @cancelled="onExportCancelled"
+            @error="onExportError" />
     </view>
 </template>
 
@@ -288,6 +331,100 @@ async function startCurrentCache(collection: Collection) {
     }
 }
 
+/* ---------------- MP4 导出 ---------------- */
+
+/** 导出服务组件 */
+const exporterRef = ref<any>(null);
+/** 是否正在导出 */
+const exporting = ref(false);
+/** 导出进度 */
+const exportDone = ref(0);
+const exportTotal = ref(0);
+const exportBytes = ref(0);
+
+/** 导出百分比。 */
+const exportPercent = computed(() =>
+    exportTotal.value ? Math.min(Math.round((exportDone.value / exportTotal.value) * 100), 100) : 0
+);
+
+/** 导出按钮文案。 */
+const exportText = computed(() => (exporting.value ? '导出中…' : '下载 MP4'));
+
+/**
+ * 当前集的原始 m3u8 地址。
+ *
+ * 导出要用**未包装代理**的原始地址（见 exporter 内部会 unwrapUrl），
+ * 这里直接给剧集自身的 vod_url。
+ */
+const currentRawUrl = computed(() => {
+    const c = collections.value[currentIndex.value];
+    return (c && c.vod_url) || '';
+});
+
+/** 点「下载 MP4」。 */
+function onExportTap() {
+    if (exporting.value) {
+        uni.showModal({
+            title: '取消导出',
+            content: '已写入的部分会被删除，确认取消？',
+            success: res => {
+                if (!res.confirm) return;
+                exporterRef.value?.cancel?.();
+                uni.showToast({ icon: 'none', title: '正在取消…' });
+            }
+        });
+        return;
+    }
+
+    if (!currentRawUrl.value) {
+        uni.showToast({ icon: 'none', title: '该集没有可下载的地址' });
+        return;
+    }
+
+    exporting.value = true;
+    exportDone.value = 0;
+    exportTotal.value = 0;
+    exportBytes.value = 0;
+    exporterRef.value?.start?.();
+}
+
+function onExportProgress(p: { done: number; total: number; bytes: number }) {
+    exportDone.value = p.done || 0;
+    exportTotal.value = p.total || 0;
+    exportBytes.value = p.bytes || 0;
+}
+
+/**
+ * 导出完成。
+ *
+ * 这里只提示路径，不做「自动打开」——
+ * 各机型对 file:// 的打开方式差异很大，强行调用容易报错，
+ * 交给用户在文件管理器里查看更稳。
+ */
+function onExportDone(res: { path?: string; bytes?: number }) {
+    exporting.value = false;
+    const size = formatSize(res?.bytes || exportBytes.value);
+    uni.showModal({
+        title: '导出完成',
+        content: `${size}\n已保存到：\n${res?.path || '下载目录'}`,
+        showCancel: false,
+        confirmText: '知道了'
+    });
+    log.info('MP4 导出完成', res?.path || '', size);
+}
+
+function onExportCancelled() {
+    exporting.value = false;
+    uni.showToast({ icon: 'none', title: '已取消导出' });
+}
+
+function onExportError(e: any) {
+    exporting.value = false;
+    const msg = (e && e.message) || '导出失败';
+    uni.showToast({ icon: 'none', title: msg });
+    log.error('MP4 导出失败', msg);
+}
+
 /* ---------------- 全屏与播放状态 ---------------- */
 
 /** 全屏按钮文案：区分「进全屏」与「退全屏」。 */
@@ -343,6 +480,19 @@ async function resolve() {
         if (!current) {
             throw new Error('无可用剧集');
         }
+
+        /*
+         * 必须先登记「当前在播哪部片的哪一集」。
+         *
+         * store 的 saveProgress 会校验 vodId / collectionId，
+         * 二者为 0 时直接 return —— 而 setCurrent 此前全项目无人调用，
+         * 于是每次 onTimeUpdate 都静默早退：续播记录只读不写，
+         * 「看过一半退出再进来」永远从头开始。
+         */
+        playStore.setCurrent(
+            { id: vodId.value, vod_name: vodName.value },
+            { id: current.id, title: current.title }
+        );
 
         // 续播位置
         const progress = playStore.loadProgress(vodId.value, current.id);
@@ -416,7 +566,34 @@ function reload() {
 /** 切换剧集。 */
 function switchEpisode(item: Collection, index: number) {
     if (index === currentIndex.value && playStore.playUrl) return;
+
+    /*
+     * 换集前先中止正在进行的导出。
+     *
+     * 导出任务绑定的是**发起时那一集的地址**，而 currentRawUrl 会随
+     * currentIndex 变化 —— 不停掉的话会出现两种错乱：
+     *   1. 旧集还在后台下载，用户以为导出的是新集
+     *   2. exporting 一直为 true，新集点「下载 MP4」直接进入「取消」分支
+     * 因此这里主动取消并提示，让状态回到干净状态。
+     */
+    if (exporting.value) {
+        exporterRef.value?.cancel?.();
+        exporting.value = false;
+        uni.showToast({ icon: 'none', title: '已停止上一集的导出' });
+    }
+
+    /*
+     * 换集前先把当前集的进度补存一笔。
+     *
+     * 不能指望 5 秒节流刚好落上 —— 用户看了 3 秒就切走，
+     * 那 3 秒会彻底丢失；下次回到这一集又是从头开始。
+     */
+    if (lastProgress) persistProgress(lastProgress.currentTime, lastProgress.duration);
+
     currentIndex.value = index;
+    // 新集从 0 起算，清掉上一集的进度快照，避免误存到新集上
+    lastProgress = null;
+    lastSaveAt = 0;
     // 内建面板由播放器自管，切集时通知它收起
     playerRef.value?.closeEpisodePanel?.();
     // 切集后缓存状态随之变化（可能切到已缓存的集）
@@ -479,11 +656,57 @@ function onEpisodeChange(index: number) {
     switchEpisode(item, index);
 }
 
+/** 续播落盘的最小间隔（毫秒）。 */
+const PROGRESS_SAVE_INTERVAL = 5000;
+
+/** 上次落盘时刻。 */
+let lastSaveAt = 0;
+
+/** 最近一次播放进度，退出/切集时用它补存最后一笔。 */
+let lastProgress: { currentTime: number; duration: number } | null = null;
+
+/**
+ * 落一次续播点。
+ *
+ * 同时更新两份记录：
+ *   - playStore：按「影片 + 集」存的精确续播点
+ *   - 历史列表：供「最近观看」页展示进度条
+ *
+ * 注意 playStore 的 vodId/collectionId 必须已登记（见 resolve 里的 setCurrent），
+ * 否则它会静默丢弃。
+ */
+function persistProgress(currentTime: number, duration: number) {
+    if (!(currentTime > 0)) return;
+    lastProgress = { currentTime, duration };
+    lastSaveAt = Date.now();
+    playStore.saveProgress(currentTime, duration);
+
+    const current = collections.value[currentIndex.value];
+    if (!current) return;
+    addHistory({
+        vodId: vodId.value,
+        vodName: vodName.value,
+        vodPic: vodPic.value,
+        collectionId: current.id,
+        collectionTitle: episodeTitle.value,
+        position: currentTime,
+        duration: duration || 0
+    });
+}
+
 /** 播放进度变化：保存续播点。 */
 function onTimeUpdate(payload: { currentTime: number; duration: number }) {
-    // 每 5 秒落一次盘，避免频繁写存储
-    if (Math.floor(payload.currentTime) % 5 !== 0) return;
-    playStore.saveProgress(payload.currentTime, payload.duration);
+    /*
+     * 按**时间间隔**节流，而不是按「秒数取模」。
+     *
+     * 取模的写法有两个坑：
+     *   1. timeupdate 约每 250ms 一次，一秒内会命中 4 次，
+     *      等于「每 5 秒写 4 次存储」，节流形同虚设
+     *   2. 播放速度非整数（1.25x）或起播时 currentTime 恰好在
+     *      非整秒区间时，可能长时间落不到 5 的整数倍上
+     */
+    if (Date.now() - lastSaveAt < PROGRESS_SAVE_INTERVAL) return;
+    persistProgress(payload.currentTime, payload.duration);
 }
 
 /** 播放结束：自动下一集。 */
@@ -494,9 +717,21 @@ function onEnded() {
     }
 }
 
-/** 播放出错：尝试换线路，再失败则重新解析。 */
+/** 播放出错：先看播放器是否正在自愈，再决定换线路还是重新解析。 */
 async function onPlayError(err: any) {
     log.error('播放出错', JSON.stringify(err), '当前地址', playStore.playUrl);
+
+    /*
+     * 播放器正在原地重试（网络抖动、坏分片）。
+     *
+     * 此时**不要**抢着换线路：播放器的重载往往几百毫秒就恢复了，
+     * 父页面一换线路等于把正在恢复的流又打断一次，
+     * 结果两边互相拆台、反而更容易播不出来。
+     */
+    if (err && err.retrying) {
+        log.info('播放器正在原地重试，暂不切换线路');
+        return;
+    }
 
     if (playStore.switchToBackup()) {
         log.info('已切换备用线路', playStore.playUrl);
@@ -563,6 +798,28 @@ onLoad(options => {
 });
 
 onUnload(() => {
+    /*
+     * 中止未完成的导出。
+     *
+     * 组件随页面一起卸载，导出循环里的 request 再也等不到响应，
+     * 会一路空转到超时；而渲染层的输出流若不关闭，
+     * 会留下一个「有内容但结构不完整」的 mp4 —— 用户以为下好了，
+     * 打开却是坏的。这里主动取消，让它删掉半成品。
+     */
+    if (exporting.value) {
+        exporterRef.value?.cancel?.();
+        exporting.value = false;
+    }
+
+    /*
+     * 退出前补存最后一笔进度。
+     *
+     * 必须放在 destroy 之前：destroy 会释放播放源，
+     * 之后再读 currentTime 已经拿不到有效值。
+     * 有了这一步，用户「看到一半直接返回」也能续上。
+     */
+    if (lastProgress) persistProgress(lastProgress.currentTime, lastProgress.duration);
+
     // 退出前销毁播放器：解除全屏、还原系统方向 / 状态栏 / 屏幕亮度
     playerRef.value?.destroy?.();
     isLandscape.value = false;
@@ -609,17 +866,58 @@ onUnload(() => {
     }
 
     &__loading {
+        position: relative;
         width: 100%;
         height: 100%;
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
+        overflow: hidden;
+    }
+
+    /* 首屏海报背景：铺满并压暗，只作为氛围 */
+    &__loading-bg {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        opacity: 0.5;
+    }
+
+    /* 压暗层：让前景文案在任何海报上都能看清 */
+    &__loading-mask {
+        position: absolute;
+        left: 0;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        background-color: rgba(11, 13, 16, 0.62);
+    }
+
+    &__loading-body {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 0 48rpx;
+    }
+
+    /* 加载转圈：与播放器内浮层的进度环同一视觉语言 */
+    &__loading-spin {
+        width: 48rpx;
+        height: 48rpx;
+        margin-bottom: 24rpx;
+        border: 3rpx solid rgba(255, 255, 255, 0.16);
+        border-top-color: #f0a63c;
+        border-radius: 50%;
+        animation: play-spin 0.8s linear infinite;
     }
 
     &__loading-text {
         font-size: 26rpx;
-        color: #6b7280;
+        color: #9aa1ac;
     }
 
     &__reason {
@@ -753,6 +1051,16 @@ onUnload(() => {
 
     &__tail {
         height: calc(60rpx + env(safe-area-inset-bottom));
+    }
+}
+
+/* 加载转圈：定义在 .play 之外，避免被嵌套选择器额外加前缀 */
+@keyframes play-spin {
+    from {
+        transform: rotate(0);
+    }
+    to {
+        transform: rotate(360deg);
     }
 }
 </style>

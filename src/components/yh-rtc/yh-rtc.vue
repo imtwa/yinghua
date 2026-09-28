@@ -28,12 +28,27 @@ export default {
         roomId: { type: String, default: '' },
         /** 显示名，随信令 metadata 传给对端 */
         displayName: { type: String, default: '' },
-        /** 进入后是否自动开始通话 */
+        /** 进入后是否自动连接信令（默认 true） */
         autoStart: { type: Boolean, default: true },
         /** 初始是否开启摄像头 */
         initialVideo: { type: Boolean, default: true },
         /** 初始是否开启麦克风 */
-        initialAudio: { type: Boolean, default: true }
+        initialAudio: { type: Boolean, default: true },
+        /**
+         * 是否采集并推送本地音视频。
+         *
+         * **与信令无关** —— 信令始终连接（房间同步依赖它），
+         * 这个开关只决定「要不要动摄像头/麦克风」。
+         *
+         * 拆开的理由：房间同步（片源、进度、选集）全部走 WebRTC 的
+         * dataChannel，而 dataChannel 只需要信令与一条 PeerConnection，
+         * 跟有没有摄像头毫无关系。早先二者绑在一起，导致「不开通话就
+         * 收不到房主的片源」—— 观众会一直卡在「等待房主选片」。
+         *
+         * 默认 false：进房间不主动弹摄像头权限，用户点了「开启视频通话」
+         * 才采集。
+         */
+        mediaOn: { type: Boolean, default: false }
     },
     data() {
         return {
@@ -52,6 +67,16 @@ export default {
             status: 'idle',
             /** 远端是否已接入 */
             hasRemote: false,
+            /**
+             * 媒体是否就绪（摄像头/麦克风）。
+             *
+             * 与 status 分开：信令连上了但摄像头被拒时，
+             * 房间同步照常工作，界面应显示「已连接（无画面）」
+             * 而不是「连接异常」。
+             */
+            mediaReady: false,
+            /** 媒体失败原因（供界面展示与重试） */
+            mediaError: '',
             errorText: ''
         };
     },
@@ -59,13 +84,15 @@ export default {
         wrapperId() {
             return `rtc-${this.seed}`;
         },
+        /** 对外暴露的配置（含房间号与显示名）。 */
         config() {
             return {
                 roomId: this.roomId,
                 displayName: this.displayName,
                 autoStart: this.autoStart,
                 initialVideo: this.initialVideo,
-                initialAudio: this.initialAudio
+                initialAudio: this.initialAudio,
+                mediaOn: this.mediaOn
             };
         }
     },
@@ -125,6 +152,11 @@ export default {
                 this.status = data;
             } else if (event === 'remote') {
                 this.hasRemote = !!data;
+            } else if (event === 'localready') {
+                this.mediaReady = !!(data && data.media);
+            } else if (event === 'mediaerror') {
+                this.mediaReady = false;
+                this.mediaError = (data && data.message) || '无法访问摄像头';
             } else if (event === 'error') {
                 this.errorText = (data && data.message) || '通话失败';
             }
@@ -136,6 +168,15 @@ export default {
         /** 开始通话（请求摄像头/麦克风并连接信令）。 */
         start() {
             this.sendCommand('start');
+        },
+        /**
+         * 重试获取摄像头/麦克风。
+         *
+         * 用户去系统设置里放开权限后回来调它，不影响已建立的连接
+         * 与正在同步的播放进度。
+         */
+        retryMedia() {
+            this.sendCommand('retrymedia');
         },
         /** 结束通话并释放设备。 */
         stop() {
@@ -161,6 +202,19 @@ export default {
          */
         resume() {
             this.sendCommand('resume');
+        },
+        /**
+         * 开始采集并推送本地音视频（「开启视频通话」）。
+         *
+         * 信令此时早已连上（组件挂载即连），这里只动摄像头/麦克风 ——
+         * 因此开摄像头是「锦上添花」，不影响房间同步。
+         */
+        startMedia() {
+            this.sendCommand('startmedia');
+        },
+        /** 停止采集并释放设备（挂断），但保持信令与房间同步。 */
+        stopMedia() {
+            this.sendCommand('stopmedia');
         },
         /**
          * 向所有已连接的对端广播一条消息。
@@ -226,10 +280,20 @@ const SIGNAL_URL = 'https://weston-vue-webrtc-lobby.azurewebsites.net';
 const REDISCOVER_INTERVAL = 3000;
 const CONNECT_TIMEOUT = 15000;
 
+/*
+ * ICE 服务器。
+ *
+ * renderjs 不能 import，因此这里与 constants/rtc.ts **各存一份** ——
+ * 修改时必须两处同步，否则实际生效的是这一份。
+ *
+ * 配置多个 STUN 的原因见 constants/rtc.ts 的注释：单个服务器不一定可达，
+ * 本机实测 stun.qq.com 就超时，只配它会导致收集不到公网候选。
+ */
 const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.qq.com:3478' }
+    { urls: 'stun:stun.miwifi.com:3478' },
+    { urls: 'stun:stun.chat.bilibili.com:3478' }
 ];
 
 const CSS_TEXT = `
@@ -321,7 +385,9 @@ export default {
             rediscoverTimer: null,
             destroyed: false,
             /** 是否正在监听设备 */
-            running: false
+            running: false,
+            /** 固化后的房间名（由 waitRoomId 落定，避免 conf 后续被覆盖） */
+            roomIdFixed: ''
         };
     },
     computed: {
@@ -413,18 +479,37 @@ export default {
         },
 
         onConfigChange(conf) {
+            const prev = this.conf || {};
             this.conf = conf || {};
             if (!this.num) {
                 const el = document.querySelector('[id^="rtc-"]');
                 if (el) this.num = (el.id || '').replace('rtc-', '');
             }
             this.$nextTick(() => this.setup());
+
+            /*
+             * mediaOn 变化即开关摄像头/麦克风。
+             *
+             * 页面把「开启视频通话」映射成这个 prop，因此这里要能双向响应：
+             *   false → true  开摄像头
+             *   true  → false 关摄像头并释放设备
+             *
+             * 注意只在**确实变化**时动作，否则 viewport 每次推送
+             * （显示名、房间号等任一字段变动都会推）都会重启一次摄像头。
+             */
+            const was = !!prev.mediaOn;
+            const now = !!(conf && conf.mediaOn);
+            if (now && !was && this.running) this.startMedia();
+            else if (!now && was && this.localStream) this.stopMedia();
         },
 
         onCommandChange(cmd) {
             if (!cmd) return;
             if (cmd === 'start') this.start();
             else if (cmd === 'stop') this.cleanup();
+            else if (cmd === 'retrymedia') this.retryMedia();
+            else if (cmd === 'startmedia') this.startMedia();
+            else if (cmd === 'stopmedia') this.stopMedia();
             else if (cmd === 'mute') this.toggleAudio(false);
             else if (cmd === 'unmute') this.toggleAudio(true);
             else if (cmd === 'camera:on') this.toggleVideo(true);
@@ -509,6 +594,36 @@ export default {
             }
         },
 
+        /**
+         * 等房间号就绪后再连信令。
+         *
+         * 房间号由页面在 onLoad 里生成并赋给 prop；而 renderjs 的属性同步
+         * 与组件挂载不同步 —— 首帧拿到的 conf.roomId 可能是空串。
+         * 此时若直接连信令，connectSignal 会以「缺少房间号」抛错，
+         * 信令再也起不来（房间同步彻底失效）。
+         *
+         * 因此这里轮询等待，最多约 6 秒。
+         */
+        waitRoomId() {
+            return new Promise(resolve => {
+                let tries = 0;
+                const check = () => {
+                    const id = (this.conf && this.conf.roomId) || '';
+                    if (id) {
+                        resolve(id);
+                        return;
+                    }
+                    tries += 1;
+                    if (tries > 60) {
+                        resolve('');
+                        return;
+                    }
+                    setTimeout(check, 100);
+                };
+                check();
+            });
+        },
+
         /** 刷新各处昵称标签（本地小窗、各对端格、等待提示）。 */
         updateNameBadges() {
             this.updateLocalBadge();
@@ -581,18 +696,25 @@ export default {
          * 未授权时 getUserMedia 会直接抛 NotAllowedError，
          * 用户看不到系统弹窗、只觉得「点了没反应」。
          *
-         * 这里用 Native.js 主动发起一次权限请求，让系统弹窗先出现。
-         * 任何异常都不阻断流程 —— 交给 getUserMedia 报出更准确的原因。
+         * 这里用 Native.js 主动发起权限请求，**并等待用户操作结果**。
+         *
+         * 早先的实现发完请求就立刻 resolve（注释里写「用户点完允许再点一次即可」），
+         * 实际后果是首次进入必然失败一次，而且没有任何自动重试 ——
+         * 用户看到的就是「摄像头打不开」。现在改为回调驱动：
+         * 授权成功后自动补一次取流，用户只需点一次「允许」。
          */
         grantWebviewMediaPermission() {
             return new Promise(resolve => {
                 if (!window.plus || !window.plus.android) {
+                    // 非 Android（iOS 走系统 WebView 的自动弹窗）
                     resolve();
                     return;
                 }
                 try {
                     const main = window.plus.android.runtimeMainActivity();
-                    const need = ['android.permission.CAMERA', 'android.permission.RECORD_AUDIO'].filter(p => {
+                    const perms = ['android.permission.CAMERA', 'android.permission.RECORD_AUDIO'];
+
+                    const need = perms.filter(p => {
                         try {
                             return window.plus.android.invoke(main, 'checkSelfPermission', p) !== 0;
                         } catch (e) {
@@ -605,9 +727,31 @@ export default {
                         return;
                     }
 
-                    // 权限请求是异步的，这里不阻塞：用户点完「允许」再点一次即可
-                    window.plus.android.invoke(main, 'requestPermissions', need, 1001);
-                    resolve();
+                    /*
+                     * 权限结果是异步的。这里挂一次回调，等系统弹窗结束后
+                     * 再放行 —— 不等的话紧接着的 getUserMedia 必然失败。
+                     *
+                     * 超时兜底：个别机型不回调，卡死会连信令一起拖住
+                     * （取流与信令虽已解耦，但取流任务本身不该无限挂起）。
+                     */
+                    let settled = false;
+                    const done = () => {
+                        if (settled) return;
+                        settled = true;
+                        resolve();
+                    };
+
+                    try {
+                        window.plus.android.requestPermissions(
+                            need,
+                            () => done(),   // 全部允许
+                            () => done()    // 部分/全部拒绝：交给 getUserMedia 报准确原因
+                        );
+                    } catch (e) {
+                        done();
+                        return;
+                    }
+                    setTimeout(done, 20000);
                 } catch (e) {
                     resolve();
                 }
@@ -616,43 +760,261 @@ export default {
 
         /* ---------------- 开始 / 清理 ---------------- */
 
+        /**
+         * 启动。
+         *
+         * **信令与媒体彻底解耦** —— 这是本组件最重要的一条约束。
+         *
+         * 房间同步（片源、进度、选集）全部经 WebRTC 的 dataChannel 传输，
+         * 而 dataChannel 只需要信令 + 一条 PeerConnection，
+         * **与摄像头/麦克风毫无关系**。
+         *
+         * 早先的实现是「先取流、取到了才连信令」，于是：
+         *   摄像头被拒/被占用/无设备 → getUserMedia 抛错
+         *   → connectSignal 根本不执行 → 没有 PeerConnection
+         *   → 没有 dataChannel → 房主广播的片源一条都发不出去。
+         * 观众侧的表现就是「一直等待房主选片」，哪怕房主早已选好片。
+         *
+         * 现在：信令无条件建立；媒体是否采集由 conf.mediaOn 决定，
+         * 失败也只降级为「没有画面」，绝不影响看片同步。
+         */
         async start() {
             if (this.running) return;
             this.running = true;
             this.destroyed = false;
             this.setStatus('connecting');
 
-            try {
-                // 1. 本地流
-                const stream = await this.acquireLocal();
-                this.localStream = stream;
-                if (this.localVideoEl) {
-                    this.localVideoEl.srcObject = stream;
-                    try {
-                        await this.localVideoEl.play();
-                    } catch (e) { /* 自动播放可能被拦，忽略 */ }
-                }
-                const hasVideo = stream.getVideoTracks().length > 0;
-                // 本地小窗的标签与占位状态随后统一刷新
-                this.updateLocalBadge();
+            // 1. 信令：房间同步的唯一通道，必须建立
+            const signalTask = this.connectSignal().catch(e => {
+                this.emit('error', { message: '信令连接失败：' + ((e && e.message) || e) });
+                return false;
+            });
 
-                // 2. 信令连接
-                await this.connectSignal();
+            // 2. 媒体：按需采集，失败只降级
+            const wantMedia = !!(this.conf && this.conf.mediaOn);
+            const mediaTask = wantMedia
+                ? this.acquireLocal()
+                      .then(stream => this.attachLocalStream(stream))
+                      .catch(e => {
+                          this.reportMediaFailure(e);
+                          return false;
+                      })
+                : Promise.resolve(false);
 
-                this.emit('localready', { hasVideo, hasAudio: stream.getAudioTracks().length > 0 });
-            } catch (e) {
-                this.running = false;
-                this.setStatus('error');
-                this.emit('error', { message: (e && e.message) || '启动通话失败' });
+            await signalTask;
+            const mediaOk = await mediaTask;
+
+            /*
+             * 无论媒体是否就绪都要上报。
+             *
+             * 页面靠这个事件判断「本地是否已有画面」；若只在取流成功时
+             * 才报，摄像头一坏页面就永远等不到这个事件。
+             */
+            const stream = this.localStream;
+            this.emit('localready', {
+                media: mediaOk,
+                hasVideo: !!stream && stream.getVideoTracks().length > 0,
+                hasAudio: !!stream && stream.getAudioTracks().length > 0
+            });
+        },
+
+        /**
+         * 挂上本地流：更新本地预览，并补给所有已建立的对端连接。
+         *
+         * 「补给已有连接」是媒体后到的关键路径 —— 用户可能在拒绝权限后
+         * 又去系统设置里放开再回来，此时对端连接已经建立但没有轨道。
+         */
+        async attachLocalStream(stream) {
+            this.localStream = stream;
+
+            if (this.localVideoEl) {
+                this.localVideoEl.srcObject = stream;
+                try {
+                    await this.localVideoEl.play();
+                } catch (e) { /* 自动播放可能被拦，忽略 */ }
             }
+            this.updateLocalBadge();
+
+            for (const sid of Object.keys(this.peers)) {
+                await this.applyLocalTracksToPeer(this.peers[sid]);
+            }
+            return true;
+        },
+
+        /**
+         * 把本地轨道填进某个对端。
+         *
+         * 用 `replaceTrack` 而不是 `addTrack`：前者不改变 SDP、不触发
+         * 重协商，因此在「连接建立之后才拿到摄像头」这种媒体后到的场景下
+         * 依然能直接生效。
+         *
+         * 前提是建连时已经声明过收发方向（见 createPeer 的 ensureTransceivers）——
+         * 若等有流了才 addTrack，就会触发重协商；而重协商在移动端 WebView 上
+         * 失败率不低，且本组件的信令协议只处理首次 offer，另起一套流程
+         * 复杂度与风险都不划算。
+         */
+        async applyLocalTracksToPeer(peer) {
+            if (!peer || !this.localStream || typeof peer.getTransceivers !== 'function') return;
+            for (const t of peer.getTransceivers()) {
+                const kind = t.receiver && t.receiver.track ? t.receiver.track.kind : null;
+                if (!kind || !t.sender) continue;
+                const track = this.localStream.getTracks().find(x => x.kind === kind);
+                if (!track) continue;
+                try {
+                    await t.sender.replaceTrack(track);
+                } catch (e) { /* 单个轨道失败不影响其它 */ }
+            }
+        },
+
+        /**
+         * 声明收发通道。
+         *
+         * **即使当前没有本地流也要先建 transceiver** —— 这样 SDP 里已经
+         * 声明了收发方向，之后拿到摄像头只要 replaceTrack 即可，
+         * 无需再次交换 SDP。
+         */
+        ensureTransceivers(peer) {
+            if (!peer || typeof peer.addTransceiver !== 'function') return;
+            for (const kind of ['audio', 'video']) {
+                const has = peer.getTransceivers().some(t => {
+                    const rt = t.receiver && t.receiver.track;
+                    return !!rt && rt.kind === kind;
+                });
+                if (has) continue;
+                try {
+                    peer.addTransceiver(kind, { direction: 'sendrecv' });
+                } catch (e) { /* 个别内核不支持时忽略 */ }
+            }
+        },
+
+        /**
+         * 上报媒体获取失败，并给出可操作的诊断。
+         *
+         * 单独一个事件而不是复用 error：摄像头失败时通话与看片同步其实
+         * 都还在正常工作，用「通话异常」来提示会让人误以为整个功能坏了。
+         */
+        reportMediaFailure(e) {
+            const detail = this.diagnoseMediaError(e);
+            this.updateLocalBadge();
+            this.emit('mediaerror', { message: detail, name: (e && e.name) || '' });
+        },
+
+        /**
+         * 把 getUserMedia 的失败翻译成「用户能照着做」的提示。
+         *
+         * 其中「非安全上下文」最容易被误判成代码 bug：浏览器只在
+         * https / localhost / 127.0.0.1 下提供 mediaDevices，
+         * 用 http + 局域网 IP 打开时 navigator.mediaDevices 直接是 undefined，
+         * 报错文本会像「不支持」，其实是访问方式的问题。
+         */
+        diagnoseMediaError(e) {
+            const name = (e && e.name) || '';
+
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                if (typeof window !== 'undefined' && window.isSecureContext === false) {
+                    return '当前页面不是安全环境：H5 端需用 https 或 localhost 打开，http + 局域网 IP 会被浏览器禁止调用摄像头';
+                }
+                return '当前环境不提供摄像头接口';
+            }
+
+            if (name === 'NotAllowedError' || name === 'SecurityError') {
+                return '摄像头/麦克风权限被拒绝，请在系统设置里允许后重试';
+            }
+            if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+                return '没有检测到可用的摄像头或麦克风';
+            }
+            if (name === 'NotReadableError' || name === 'TrackStartError') {
+                return '摄像头可能被其它应用占用，请关闭其它应用后重试';
+            }
+            if (name === 'OverconstrainedError') {
+                return '摄像头不支持所请求的参数';
+            }
+            return (e && e.message) || '无法访问摄像头/麦克风';
+        },
+
+        /**
+         * 重新尝试获取本地媒体。
+         *
+         * 用户去系统设置里放开权限后回到页面，这就是重试入口。
+         * 不影响已建立的连接与正在同步的播放进度。
+         */
+        async retryMedia() {
+            if (this.localStream) {
+                this.updateLocalBadge();
+                return true;
+            }
+            return this.startMedia();
+        },
+
+        /**
+         * 开始采集本地音视频并推送给所有对端。
+         *
+         * 这是「开启视频通话」的入口。与信令解耦 —— 信令早在组件挂载时
+         * 就连上了，这里只负责动摄像头/麦克风。
+         */
+        async startMedia() {
+            if (this.localStream) {
+                this.updateLocalBadge();
+                return true;
+            }
+            try {
+                const stream = await this.acquireLocal();
+                await this.attachLocalStream(stream);
+                this.emit('localready', {
+                    media: true,
+                    hasVideo: stream.getVideoTracks().length > 0,
+                    hasAudio: stream.getAudioTracks().length > 0
+                });
+                return true;
+            } catch (e) {
+                this.reportMediaFailure(e);
+                return false;
+            }
+        },
+
+        /**
+         * 停止采集并释放设备（挂断）。
+         *
+         * **只停媒体，不断信令** —— 房间同步要继续工作。
+         * 真正断开信令由 cleanup 负责（离开页面时）。
+         */
+        stopMedia() {
+            if (this.localStream) {
+                // 先解除各对端发送的轨道，避免对端画面停在最后一帧
+                for (const sid of Object.keys(this.peers)) {
+                    const peer = this.peers[sid];
+                    if (!peer || typeof peer.getTransceivers !== 'function') continue;
+                    for (const t of peer.getTransceivers()) {
+                        if (t.sender) {
+                            try { t.sender.replaceTrack(null); } catch (e) { /* 忽略 */ }
+                        }
+                    }
+                }
+
+                this.localStream.getTracks().forEach(t => {
+                    try { t.stop(); } catch (e) { /* 忽略 */ }
+                });
+                this.localStream = null;
+            }
+            if (this.localVideoEl) this.localVideoEl.srcObject = null;
+            this.updateLocalBadge();
+            this.emit('localready', { media: false, hasVideo: false, hasAudio: false });
         },
 
         async connectSignal() {
             const io = await this.loadSocketIO();
             if (!io) throw new Error('socket.io 未就绪');
 
-            const roomId = this.conf.roomId || '';
+            /*
+             * 房间号可能尚未同步过来，等它就绪（见 waitRoomId）。
+             *
+             * 拿到后**存成实例字段**而不是每次读 conf.roomId：
+             * renderjs 的 conf 可能在后续同步中被覆盖成空值，
+             * 而房间号是整个会话期间不变的基准。
+             */
+            const roomId = await this.waitRoomId();
             if (!roomId) throw new Error('缺少房间号');
+            this.roomIdFixed = roomId;
 
             this.socket = io(SIGNAL_URL, {
                 transports: ['websocket', 'polling'],
@@ -695,10 +1057,15 @@ export default {
             });
         },
 
+        /** 本次会话的房间名（conf.roomId 落定后固化的值）。 */
+        roomName() {
+            return this.roomIdFixed || (this.conf && this.conf.roomId) || '';
+        },
+
         discover() {
             if (this.socket && this.socket.connected) {
                 // 必须传字符串（房间名）
-                this.socket.emit(EV.discover, this.conf.roomId || '');
+                this.socket.emit(EV.discover, this.roomName());
             }
         },
 
@@ -706,7 +1073,18 @@ export default {
             this.stopRediscover();
             this.rediscoverTimer = setInterval(() => {
                 this.discover();
-                this.updateWaitHint();
+
+                /*
+                 * 顺带刷新等待提示。
+                 *
+                 * 注意：这里必须调**已存在**的方法。早先写的是
+                 * `this.updateWaitHint()` —— 该方法在本组件里从未定义，
+                 * 于是每 3 秒（REDISCOVER_INTERVAL）就抛一次 TypeError。
+                 * 这个定时器是「发现中途加入的成员」的唯一途径，
+                 * 它一抛错，配对就再也建立不起来 ——
+                 * 表现为「两人都在房间、界面却始终显示等待对方接入」。
+                 */
+                this.updateNameBadges();
             }, REDISCOVER_INTERVAL);
         },
 
@@ -769,12 +1147,37 @@ export default {
             // 对方的名字随 offer 的 metadata 送来
             this.rememberPeerName(initiator, metadata);
 
+            /*
+             * 标记「已在应答中」，必须放在最前面。
+             *
+             * 这里防的是**双方同时发起 offer**（glare）：
+             * onDiscover 里 id 较大的一方会等 4 秒再补发，但 offer 从发出
+             * 到 setRemoteDescription 完成可能超过 4 秒（App 端 + 弱网尤其常见），
+             * 于是等待方误判「对方没发」又自己发起一次 —— 两条连接互相打架，
+             * 常见后果是两条都停在 connecting、dataChannel 永远不 open，
+             * 表现为「通话界面正常但同步消息一条都收不到」。
+             *
+             * 置成非空值即可让 onDiscover 的 `if (this.connectedIds[peerId]) continue`
+             * 跳过重复发起（该判断对任意非空值都成立）。
+             */
+            this.connectedIds[initiator] = 'answering';
+
             let peer = this.peers[sessionId];
             if (!peer) {
                 peer = this.createPeer(initiator, false, sessionId);
             }
             try {
                 await peer.setRemoteDescription(signal);
+
+                /*
+                 * 描述就绪后再补本地轨道。
+                 *
+                 * 应答方的 transceiver 是**由对方的 offer 创建**的 ——
+                 * setRemoteDescription 之前 getTransceivers() 还是空的，
+                 * 提前调 applyLocalTracksToPeer 什么也填不进去，
+                 * 结果就是观众听不到房主的声音。
+                 */
+                if (this.localStream) await this.applyLocalTracksToPeer(peer);
 
                 // 补投在 offer 之前就到了的候选
                 const pending = peer._pendingCandidates.splice(0);
@@ -890,11 +1293,22 @@ export default {
                 this.setupDataChannel(e.channel, peer);
             };
 
-            // 推本地轨道
-            if (this.localStream) {
-                for (const track of this.localStream.getTracks()) {
-                    peer.addTrack(track, this.localStream);
-                }
+            /*
+             * 先声明收发方向，再填本地轨道。
+             *
+             * 顺序很关键：若此时还没有本地流（信令先行、摄像头失败或后到），
+             * 没有 transceiver 的 SDP 里就不会有 audio/video 的 m 行，
+             * 对方即便开了摄像头也推不过来 —— 表现为单向黑屏。
+             * 预声明之后，媒体可以随时用 replaceTrack 补进来。
+             *
+             * 只有发起方需要预声明：应答方的 m 行来自对方的 offer，
+             * 在 setRemoteDescription 之后自然就有 transceiver 了
+             * （见 onOffer 里的补轨道）。
+             */
+            if (initiator) {
+                this.ensureTransceivers(peer);
+                // 此时 transceiver 已就绪，可以直接把已有流填进去
+                if (this.localStream) this.applyLocalTracksToPeer(peer);
             }
 
             // ICE 候选：边收集边发（trickle）
@@ -1019,21 +1433,49 @@ export default {
          * 向所有已连接的对端广播一条消息。
          *
          * 播放同步、切集通知都走这里；父组件只关心消息体。
+         *
+         * 关键：**没有可用通道时要明确回报**。
+         * 早先这里对空通道直接静默 return，于是「观众一直等待房主选片」
+         * 这种故障在日志里没有任何痕迹 —— 分不清是消息没发出去、
+         * 还是发出去但对方没处理。现在把发送结果回报给逻辑层，
+         * 房主侧能据此看到「房间同步未建立」而不是毫无头绪。
          */
         broadcast(msg) {
-            if (!this.channels) return;
+            if (!this.channels) {
+                this.emit('broadcastfail', { reason: 'nochannel' });
+                return false;
+            }
+
             let text = '';
             try {
                 text = JSON.stringify(msg);
             } catch (e) {
-                return;
+                return false;
             }
+
+            let sent = 0;
             for (const sid of Object.keys(this.channels)) {
                 const ch = this.channels[sid];
                 try {
-                    if (ch && ch.readyState === 'open') ch.send(text);
-                } catch (e) { /* 忽略 */ }
+                    if (ch && ch.readyState === 'open') {
+                        ch.send(text);
+                        sent += 1;
+                    }
+                } catch (e) { /* 忽略单个通道失败 */ }
             }
+
+            if (sent === 0) {
+                /*
+                 * 区分两种情形，便于定位：
+                 *   nochannel —— 一个 PeerConnection 都还没建起来（信令问题）
+                 *   notopen   —— 连上了但 dataChannel 还没 open（协商中）
+                 */
+                this.emit('broadcastfail', {
+                    reason: Object.keys(this.channels).length ? 'notopen' : 'nochannel'
+                });
+                return false;
+            }
+            return true;
         },
 
         /** 广播播放状态（房主用）。 */
@@ -1243,6 +1685,17 @@ export default {
         /* ---------------- 清理 ---------------- */
 
         cleanup() {
+            /*
+             * 先上报状态，再置 destroyed。
+             *
+             * emit 内部有 `if (this.destroyed) return` 的存活检查，
+             * 若先置 destroyed 再 emit，这两条通知会被自己拦截 ——
+             * 页面侧的 callStatus / hasRemote 会永远停在旧值
+             * （表现为「已挂断但界面仍显示对方已接入」）。
+             */
+            this.setStatus('idle');
+            this.emit('remote', false);
+
             this.destroyed = true;
             this.running = false;
             this.stopRediscover();
@@ -1281,8 +1734,8 @@ export default {
                 this.socket = null;
             }
 
-            this.setStatus('idle');
-            this.emit('remote', false);
+            // 复位房间名，允许之后用新房间重新 start
+            this.roomIdFixed = '';
         }
     }
 };

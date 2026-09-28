@@ -329,6 +329,13 @@ function toVod(raw: any): Vod {
         vod_remarks: raw.vod_remarks || '',
         vod_score: String(raw.vod_douban_score || ''),
         vod_content: raw.vod_content || raw.vod_blurb || '',
+        /*
+         * 导演。
+         *
+         * 苹果CMS 标准字段是 vod_director；部分源用 vod_director 以外的
+         * 变体或干脆不给，故做兜底。详情页会按空值隐藏该行。
+         */
+        vod_director: raw.vod_director || raw.vod_directors || '',
         vod_total: Number(raw.vod_total) || 0,
         type_pid: Number(raw.type_id_1) || Number(raw.type_id) || 0,
         // 附加字段：列表页也带播放地址，可直接进播放页
