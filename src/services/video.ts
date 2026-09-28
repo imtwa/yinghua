@@ -177,6 +177,53 @@ async function fetchAny(
  * 分类解析（名字 → 各源自己的 type_id）
  * ---------------------------------------------------------------- */
 
+/**
+ * 需要屏蔽的分类关键词。
+ *
+ * 已逐个源核对真实分类名（7 个源共 335 个分类），命中的全部如下：
+ *   暴风   福利
+ *   量子   伦理片
+ *   魔都   里番动漫、伦理片
+ *   电影天堂 伦理片
+ *   红牛   伦理片
+ *   索尼   伦理、港台三级、韩国伦理、西方伦理、日本伦理、写真热舞
+ *   无尽   伦理片、港台三级、韩国伦理、西方伦理、日本伦理、写真热舞
+ *
+ *  「理论片」也在屏蔽之列，且**必须靠这个关键词**：
+ *   它名字看着像纪录片/理论类，实际是成人影片的委婉叫法 ——
+ *   实测该分类 1522 条全是情色内容（《性是谎言2》《罗娜艳情录》
+ *   《喜爱夜蒲3》…）。只按「伦理/福利」匹配会漏掉它。
+ *
+ * 反向注意：不要用「片」这类单字匹配，会误伤「动作片」「纪录片」。
+ */
+const BLOCKED_CLASS_WORDS = [
+    '福利',
+    '伦理',
+    '理论',
+    '里番',
+    '三级',
+    '写真',
+    '热舞',
+    '成人',
+    '情色',
+    '色情',
+    '麻豆',
+    '无码'
+];
+
+/**
+ * 判断分类名是否属于需屏蔽的分组。
+ *
+ * 采用**包含**匹配而非全等：各源命名不统一
+ * （「伦理」/「伦理片」/「韩国伦理」/「港台三级」），
+ * 用包含能一次覆盖全部变体，新增源也大概率被拦住。
+ */
+function isBlockedClass(name: string): boolean {
+    const n = String(name || '').trim();
+    if (!n) return false;
+    return BLOCKED_CLASS_WORDS.some(w => n.includes(w));
+}
+
 /** 分类表中的一项。 */
 interface ClassNode {
     id: number;
@@ -206,6 +253,22 @@ async function getClassTree(source: ContentSource): Promise<Record<string, Class
         const id = Number(c.type_id) || 0;
         const name = String(c.type_name || '').trim();
         if (!id || !name) continue;
+
+        /*
+         * 屏蔽敏感分类。
+         *
+         * 必须在建树时就拦掉，而不是只在「分类列表」出口过滤 ——
+         * 因为 getChannelInfo 会把**父类 + 全部子类**一起聚合，
+         * 而这些源的敏感分类恰好多挂在正常父类下：
+         *   量子「电影片(1)」的子类含「伦理片(34)」
+         *   魔都「电影(7)」的子类含「伦理片(39)」
+         * 只在出口过滤一级分类的话，用户点进「电影片」照样会拉到
+         * 那些内容，等于没过滤。
+         *
+         * 同时 name → node 的映射里也不会出现它，
+         * 于是按名字查分类时自然查不到，无需额外判断。
+         */
+        if (isBlockedClass(name)) continue;
 
         /*
          * type_pid 缺失（红牛、无尽、索尼等源）时按一级处理 ——
@@ -398,8 +461,17 @@ export async function getChannels(): Promise<Channel[]> {
         const raw = c.type_pid;
         return raw === undefined || raw === null || raw === '' || Number(raw) === 0;
     };
-    const top = classes.filter(isTop);
-    const list = (top.length > 0 ? top : classes).map(toChannel);
+
+    /*
+     * 屏蔽敏感分组。
+     *
+     * 这里必须单独过滤：本函数走的是 fetchAny 的**原始**分类数据，
+     * 不经过 getClassTree，因此那边的过滤管不到这里。
+     * 漏掉这一步，分类页仍会列出「福利」「伦理片」等入口。
+     */
+    const visible = classes.filter((c: any) => !isBlockedClass(String(c.type_name || '')));
+    const top = visible.filter(isTop);
+    const list = (top.length > 0 ? top : visible).map(toChannel);
 
     log.info('分类列表', list.map(c => c.channel_name));
     return list;
