@@ -945,9 +945,65 @@ export default {
                 } catch (e) {
                     console.warn(`[rtc] ${kind} 轨道装配失败:`, (e && e.message) || e);
                 }
+
+                /*
+                 * 装了轨道但方向仍是 recvonly —— 媒体发不出去。
+                 *
+                 * 这是最隐蔽的一种「假成功」：replaceTrack 不报错、轨道数
+                 * 也计入了，但对端一个字节都收不到。正常流程下
+                 * promoteSendRecv 已把方向提好，走到这里说明有路径漏了，
+                 * 必须显式喊出来，否则又变成无声黑屏。
+                 */
+                if (t.direction === 'recvonly') {
+                    console.warn(
+                        `[rtc] ${kind} 方向仍为 recvonly，轨道装上了也发不出去` +
+                        '（应在 createAnswer 前调用 promoteSendRecv）'
+                    );
+                }
             }
 
             console.log(`[rtc] 轨道装配完成: ${filled}/${transceivers.length} 个 transceiver 已填充`);
+        },
+
+        /**
+         * 把收发方向提成 sendrecv。
+         *
+         * ## 为什么必须有这一步
+         *
+         * 应答方的 transceiver 是**由对方的 offer 创建**的，规范规定
+         * 其 `direction` 一律为 `recvonly`。若直接 createAnswer，
+         * 答案里对应的 m 行就是 `recvonly` —— 本端**只收不发**。
+         *
+         * 而 `replaceTrack` 只更换 sender 上的轨道，**完全不改变 SDP
+         * 里的方向**。所以哪怕日志显示「轨道装配完成: 2/2 个 transceiver
+         * 已填充」，媒体依然一个字节都发不出去，对端也不会触发 ontrack。
+         *
+         * 表现就是**单向可见**：谁当应答方谁黑屏，另一端却看得到他。
+         * 谁当应答方由 socket.id 字典序裁定（见 onDiscover），
+         * 因此房主和观众都可能中招，且症状随配对结果变化，极难自查。
+         *
+         * 必须在 `setRemoteDescription` 之后、`createAnswer` 之前调用 ——
+         * 提前调 getTransceivers() 还是空的，推后调答案已经发出去了。
+         */
+        promoteSendRecv(peer) {
+            if (!peer || typeof peer.getTransceivers !== 'function') return;
+
+            let changed = 0;
+            for (const t of peer.getTransceivers()) {
+                if (!t || t.stopped) continue;
+                // 已经能发就不动它，避免无谓的重复协商
+                if (t.direction === 'sendrecv' || t.direction === 'sendonly') continue;
+                try {
+                    t.direction = 'sendrecv';
+                    changed += 1;
+                } catch (e) {
+                    console.warn('[rtc] 提升收发方向失败:', (e && e.message) || e);
+                }
+            }
+
+            if (changed) {
+                console.log(`[rtc] 已把 ${changed} 个 transceiver 的方向提为 sendrecv`);
+            }
         },
 
         /**
@@ -1274,13 +1330,16 @@ export default {
                 await peer.setRemoteDescription(signal);
 
                 /*
-                 * 描述就绪后再补本地轨道。
+                 * 描述就绪后**先提方向、再补轨道**。
                  *
-                 * 应答方的 transceiver 是**由对方的 offer 创建**的 ——
-                 * setRemoteDescription 之前 getTransceivers() 还是空的，
-                 * 提前调 applyLocalTracksToPeer 什么也填不进去，
-                 * 结果就是观众听不到房主的声音。
+                 * 应答方的 transceiver 由对方 offer 创建，默认 `recvonly`；
+                 * 不提升方向，答案里那一行就只收不发，本端画面永远出不去
+                 * （详见 promoteSendRecv 的说明）。
+                 *
+                 * 另外 setRemoteDescription 之前 getTransceivers() 还是空的，
+                 * 提前调 applyLocalTracksToPeer 什么也填不进去。
                  */
+                this.promoteSendRecv(peer);
                 if (this.localStream) await this.applyLocalTracksToPeer(peer);
 
                 // 补投在 offer 之前就到了的候选
