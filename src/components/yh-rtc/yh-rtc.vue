@@ -292,6 +292,22 @@ const SIGNAL_URL = 'https://weston-vue-webrtc-lobby.azurewebsites.net';
 const REDISCOVER_INTERVAL = 3000;
 const CONNECT_TIMEOUT = 15000;
 
+/**
+ * 等待对方 offer 的兜底时长（毫秒）。
+ *
+ * 超过它仍没收到 offer 才由本端补发起。取值要比「一次 offer 往返」明显长，
+ * 否则 App 端弱网下会把正常的慢 offer 误判成丢失，反而制造 glare。
+ */
+const FALLBACK_OFFER_DELAY = 6000;
+
+/**
+ * disconnected 状态的最长容忍时间（毫秒）。
+ *
+ * 超过它仍未恢复 connected 就按失效处理并允许重建。取值要明显大于
+ * 内核自愈所需时间（通常 1~3 秒），否则网络轻微抖动就把连接拆了。
+ */
+const RECOVER_TIMEOUT = 8000;
+
 /*
  * ICE 服务器。
  *
@@ -392,8 +408,41 @@ export default {
             peerNames: {},
             /** 已建立连接的远端 id，避免重复发起 */
             connectedIds: {},
+            /**
+             * 早到信令暂存：sessionId -> 消息数组。
+             *
+             * 候选/answer 与 offer 是两条独立通道，网络快时前者会**先于**
+             * offer 到达。此时 `this.peers[sessionId]` 还不存在，
+             * 旧实现直接 `return` 把消息丢了 —— 该连接的候选就此残缺，
+             * 只能等 ICE 超时。
+             *
+             * 两人场景下 offer 与候选间隔极短，很少撞上；三人及以上时
+             * 多条连接并发协商，交错概率大幅上升，表现为「某人一直连不上」。
+             * 因此这里先收着，等 createPeer 之后补投。
+             */
+            earlySignals: {},
+            /** 兜底发起定时器：远端 id -> timer（便于在 offer 到达时取消） */
+            fallbackTimers: {},
+            /** 连接超时定时器：sessionId -> timer（重复发起时先清旧的） */
+            connectTimers: {},
+            /** disconnected 恢复兜底定时器：sessionId -> timer */
+            recoverTimers: {},
             /** 本地媒体流 */
             localStream: null,
+            /**
+             * 正在进行的取流任务（重入保护）。
+             *
+             * startMedia 有两条触发路径（prop 变化 + 指令），可能同帧先后到达；
+             * 用这个在飞 Promise 让后来者复用同一次结果，避免并发 getUserMedia
+             * 导致前一条流被覆盖而永不释放。
+             *
+             * 命名**不带下划线前缀**：Vue 2 的 isReserved() 会把 `_x`
+             * 视为保留名而跳过 proxy，data 里的声明会变成死代码，
+             * 实际值只落在实例的动态属性上 —— 能跑，但读代码时极易误判。
+             */
+            mediaTask: null,
+            /** 取流是否已被取消（stopMedia 置位，doStartMedia 检查） */
+            mediaCancelled: false,
             rediscoverTimer: null,
             destroyed: false,
             /** 是否正在监听设备 */
@@ -511,8 +560,20 @@ export default {
              */
             const was = !!prev.mediaOn;
             const now = !!(conf && conf.mediaOn);
-            if (now && !was && this.running) this.startMedia();
-            else if (!now && was && this.localStream) this.stopMedia();
+            if (now && !was && this.running) {
+                this.startMedia();
+            } else if (!now && was) {
+                /*
+                 * 关闭时**不判断 localStream 是否存在**。
+                 *
+                 * 早先写成 `&& this.localStream` 才调 stopMedia —— 但取流失败时
+                 * localStream 本就是 null，于是这次「关闭」被整个跳过：
+                 * 各对端 sender 上的旧轨道没被解除，对端画面停在最后一帧，
+                 * 而本地已经不再采集，双方状态就此不一致。
+                 * stopMedia 内部对 null 流是安全的，无条件调用即可。
+                 */
+                this.stopMedia();
+            }
         },
 
         onCommandChange(cmd) {
@@ -683,16 +744,22 @@ export default {
             const wantAudio = this.conf.initialAudio !== false;
 
             /*
-             * 降级链：音视频 → 纯音频。
+             * 降级链：音视频 → 纯音频；只开摄像头时退为纯视频。
              *
-             * ⚠️ 曾经这里还有第三项 `{ video: false, audio: false }`，
-             * 是本次「视频通话没画面但也不报错」的根因：
+             * ⚠️ 曾经这里还有一项 `{ video: false, audio: false }`，
+             * 是「视频通话没画面但也不报错」的根因：
              * 该调用在规范上**合法且会成功**，返回一个不含任何轨道的空流，
              * 于是摄像头失败时会被误判为「取流成功」——
              * 不抛异常、不报错、不打日志，流里却一个轨道都没有。
-             * 表现为「电话能通（退成纯音频）、但没有画面、控制台无任何线索」。
              *
-             * 现在去掉它：降级只能降到纯音频，全失败就如实抛错。
+             * 但去掉它之后又留下另一个边界：**只要视频、不要音频**时
+             * （initialAudio 显式传 false），两个条件都不成立，
+             * `tries` 会是**空数组** —— 循环一次都不跑，直接抛
+             * 「无法访问摄像头/麦克风」，连摄像头都开不起来。
+             * 因此为「纯视频」单独补一档。
+             *
+             * 注意纯视频**排在纯音频之后**：音视频都想要时若摄像头坏了，
+             * 应该退成「能通话」而不是「只有画面没声音」—— 音频是刚需。
              */
             const tries = [];
             if (wantVideo && wantAudio) {
@@ -706,6 +773,15 @@ export default {
             }
             if (wantAudio) {
                 tries.push({ label: '纯音频', constraints: { video: false, audio: true } });
+            }
+            if (wantVideo && !wantAudio) {
+                tries.push({
+                    label: '纯视频',
+                    constraints: {
+                        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+                        audio: false
+                    }
+                });
             }
 
             console.log('[rtc] 开始取流，降级链:', tries.map(t => t.label).join(' → '));
@@ -851,16 +927,21 @@ export default {
                 return false;
             });
 
-            // 2. 媒体：按需采集，失败只降级
+            /*
+             * 2. 媒体：按需采集，失败只降级。
+             *
+             * **必须走 startMedia，不能自己 acquireLocal + attachLocalStream**。
+             * 那条旧写法绕过了 startMedia 的三重保护：
+             *   · 重入闸门（mediaTask）—— 与 onConfigChange 的自动开启并发时
+             *     会发起两次 getUserMedia，前一条流永不释放
+             *   · 取消标记（mediaCancelled）—— 启动途中挂断，流仍会被装上
+             *   · mediaReady / localready 的完整上报
+             * 症状与「点开启视频通话」时的不一致完全相同，只是触发路径不同。
+             *
+             * startMedia 内部已含 reportMediaFailure，无需再 catch 一遍。
+             */
             const wantMedia = !!(this.conf && this.conf.mediaOn);
-            const mediaTask = wantMedia
-                ? this.acquireLocal()
-                      .then(stream => this.attachLocalStream(stream))
-                      .catch(e => {
-                          this.reportMediaFailure(e);
-                          return false;
-                      })
-                : Promise.resolve(false);
+            const mediaTask = wantMedia ? this.startMedia() : Promise.resolve(false);
 
             await signalTask;
             const mediaOk = await mediaTask;
@@ -870,12 +951,21 @@ export default {
              *
              * 页面靠这个事件判断「本地是否已有画面」；若只在取流成功时
              * 才报，摄像头一坏页面就永远等不到这个事件。
+             *
+             * 字段必须与 doStartMedia 里那次 emit **保持一致**，尤其是
+             * `videoDropped`：它是页面用来提示「摄像头没启用、当前为纯音频」
+             * 的唯一依据。早先这里漏了它，导致「通话中重进房间」这条路径
+             * （autoStart + mediaOn 已为 true，媒体由 start 触发而非用户点击）
+             * 在摄像头降级时完全没有提示 —— 用户只觉得对方看不到自己。
              */
             const stream = this.localStream;
+            const hasVideo = !!stream && stream.getVideoTracks().length > 0;
+            const hasAudio = !!stream && stream.getAudioTracks().length > 0;
             this.emit('localready', {
                 media: mediaOk,
-                hasVideo: !!stream && stream.getVideoTracks().length > 0,
-                hasAudio: !!stream && stream.getAudioTracks().length > 0
+                hasVideo,
+                hasAudio,
+                videoDropped: mediaOk && !hasVideo && hasAudio
             });
         },
 
@@ -896,10 +986,55 @@ export default {
             }
             this.updateLocalBadge();
 
+            /*
+             * 逐个装配，且**逐个 await**。
+             *
+             * applyLocalTracksToPeer 内部走 runOnPeer 入队，同一 peer 的操作
+             * 天然串行；但不同 peer 之间若并发发起，会对同一个 localStream
+             * 同时做 replaceTrack —— 部分内核对并发 replaceTrack 支持不佳，
+             * 会出现某一路静默失败。顺序执行代价很小（每人几条轨道）。
+             */
             for (const sid of Object.keys(this.peers)) {
                 await this.applyLocalTracksToPeer(this.peers[sid]);
             }
             return true;
+        },
+
+        /**
+         * 把针对某个 peer 的异步信令操作**串行化**。
+         *
+         * ## 为什么必须有
+         *
+         * `setRemoteDescription` 对状态机很敏感：在同一连接上并发调用，
+         * 后一次会抛 `Failed to set remote answer sdp: Called in wrong state`。
+         * 而信令是**多条独立通道**送来的（offer / answer / candidate），
+         * 到达顺序与时机都不受控 —— 尤其对端兜底重发 offer 时，
+         * 新的 offer 可能与本端正在处理的 answer 撞在一起。
+         *
+         * 成熟库（simple-peer）内部用 `_isNegotiating` + `_queuedNegotiation`
+         * 配合 signalingStateChange 做同一件事；这里用 Promise 链达成同等效果，
+         * 实现更直白。
+         *
+         * 注意：**不得在队列内部再调 runOnPeer**（同一 peer 会自我等待而死锁）。
+         * 队列内的代码直接调 applySignal / doApplyTracks 这类纯执行函数即可。
+         */
+        runOnPeer(peer, fn) {
+            if (!peer) return Promise.resolve();
+
+            const prev = peer._opChain || Promise.resolve();
+            const next = prev
+                .then(() => {
+                    // 排队期间这条连接可能已被丢弃，直接跳过
+                    if (this.destroyed) return undefined;
+                    if (this.peers[peer._sid] !== peer) return undefined;
+                    return fn();
+                })
+                .catch(e => {
+                    console.warn('[rtc] 信令操作异常:', (e && e.message) || e);
+                });
+
+            peer._opChain = next;
+            return next;
         },
 
         /**
@@ -913,12 +1048,29 @@ export default {
          * 若等有流了才 addTrack，就会触发重协商；而重协商在移动端 WebView 上
          * 失败率不低，且本组件的信令协议只处理首次 offer，另起一套流程
          * 复杂度与风险都不划算。
+         *
+         * 本方法只负责**入队**，实际装配在 doApplyTracks。
          */
         async applyLocalTracksToPeer(peer) {
             if (!peer || !this.localStream || typeof peer.getTransceivers !== 'function') {
                 console.warn('[rtc] 无法装配轨道: peer/流缺失或内核不支持 getTransceivers');
                 return;
             }
+
+            /*
+             * 装配本身也要入队串行化。
+             *
+             * replaceTrack 虽不改 SDP，但 `t.direction` 的读取与协商状态相关：
+             * 若在 setRemoteDescription/createAnswer 进行到一半时并发执行，
+             * 读到的 direction 可能是中间态，于是把已经能发的连接误判成
+             * recvonly，甚至把方向改回去。串行之后每次装配都看到稳定状态。
+             */
+            await this.runOnPeer(peer, () => this.doApplyTracks(peer));
+        },
+
+        /** 真正把本地轨道填进对端（纯执行函数，由 runOnPeer 串行化后调用）。 */
+        async doApplyTracks(peer) {
+            if (!peer || !this.localStream) return;
 
             const transceivers = peer.getTransceivers();
             let filled = 0;
@@ -1097,8 +1249,59 @@ export default {
                 this.updateLocalBadge();
                 return true;
             }
+
+            /*
+             * 重入保护。
+             *
+             * 「开启视频通话」有两条触发路径：conf.mediaOn 变化（onConfigChange）
+             * 与 startmedia 指令（onCommandChange）。两者可能在同一帧内先后到达
+             * （页面既改 prop 又发指令）。没有这道闸门时，第二次调用会看到
+             * localStream 仍为 null（第一次还在 await 取流），于是并发发起
+             * 第二次 getUserMedia —— 拿到两条流，后一条覆盖前一条，
+             * 前一条的轨道**永不释放**，摄像头指示灯一直亮着。
+             *
+             * 用一个在飞的 Promise 让后来者复用同一次结果。
+             */
+            if (this.mediaTask) return this.mediaTask;
+
+            // 本次是「开启」，清掉上一次可能的取消标记
+            this.mediaCancelled = false;
+
+            const task = this.doStartMedia().finally(() => {
+                /*
+                 * 只清**自己**那一份句柄。
+                 *
+                 * 无条件 `this.mediaTask = null` 有竞态：若期间发生过
+                 * stopMedia（句柄被置 null）又 startMedia（挂上新句柄），
+                 * 旧任务的 finally 后到，就会把**新任务**的句柄抹掉 ——
+                 * 于是重入保护失效，再来一次 startMedia 会并发发起第二次
+                 * getUserMedia，又回到「两条流、前一条永不释放」。
+                 */
+                if (this.mediaTask === task) this.mediaTask = null;
+            });
+            this.mediaTask = task;
+            return task;
+        },
+
+        /** 实际执行取流与装配。 */
+        async doStartMedia() {
             try {
                 const stream = await this.acquireLocal();
+
+                /*
+                 * 取流期间被要求停止 —— 立刻丢弃刚拿到的流。
+                 *
+                 * 典型时序：用户点「开启通话」→ 取流要等权限弹窗（可能几秒）
+                 * → 期间又点「挂断」。没有这道检查的话，await 返回后
+                 * 照样 attachLocalStream，把刚关掉的摄像头**又打开**，
+                 * 而且这次是「界面显示已挂断、指示灯却亮着」。
+                 */
+                if (this.mediaCancelled) {
+                    console.log('[rtc] 取流完成时已被要求停止，丢弃该流');
+                    try { stream.getTracks().forEach(t => t.stop()); } catch (e) { /* 忽略 */ }
+                    return false;
+                }
+
                 await this.attachLocalStream(stream);
 
                 const hasVideo = stream.getVideoTracks().length > 0;
@@ -1139,6 +1342,27 @@ export default {
          * 真正断开信令由 cleanup 负责（离开页面时）。
          */
         stopMedia() {
+            /*
+             * 置取消标记：取流途中被停掉时，让 doStartMedia 丢弃结果。
+             *
+             * 必须在最前面 —— 下面 localStream 为 null 时（取流还没回来）
+             * 整个 if 块会被跳过，标记若不先置上，那条在飞的取流就没人拦得住。
+             */
+            this.mediaCancelled = true;
+
+            /*
+             * 清掉在飞任务句柄。
+             *
+             * 不清的话，紧接着的 startMedia 会命中
+             * `if (this.mediaTask) return this.mediaTask`，直接把**已取消的
+             * 旧任务**返回给调用方 —— 看起来「开启了」，实际什么都没做，
+             * 摄像头永远起不来。必须让下一轮重新发起真正的取流。
+             *
+             * 只置 null，不 await 旧任务：旧任务靠 mediaCancelled 自行丢弃流，
+             * 在这里等待它反而会拖住「挂断」这个应当立即生效的动作。
+             */
+            this.mediaTask = null;
+
             if (this.localStream) {
                 // 先解除各对端发送的轨道，避免对端画面停在最后一帧
                 for (const sid of Object.keys(this.peers)) {
@@ -1285,20 +1509,52 @@ export default {
                     this.createPeer(peerId, true);
                 } else {
                     /*
-                     * 我是较大的一方：正常应等对方发起。
-                     * 记一个待定标记 + 超时兜底 —— 若若干秒后仍未建立连接，
-                     * 说明对方的 offer 可能丢了，由我补发。
+                     * 我是较大的一方：正常应等对方发起，这里记待定标记。
+                     *
+                     * 兜底定时器**必须可取消** —— 旧实现是一个裸 setTimeout，
+                     * 即便对方的 offer 早就到了、连接也已建立，它仍会在 4 秒后
+                     * 触发并再发起一次 offer，形成 glare（两条 offer 互相打架）。
+                     * 两人时这个窗口很短、不易撞上；三人及以上时每条连接都挂
+                     * 一个定时器，误触发概率成倍上升，表现为「有人连上又断」。
+                     *
+                     * 因此：offer 一到就清掉它（见 onOffer），
+                     * 触发时也再校验一次当前状态。
                      */
                     this.connectedIds[peerId] = 'waiting';
-                    const target = peerId;
-                    setTimeout(() => {
-                        if (this.destroyed) return;
-                        if (this.connectedIds[target] === 'waiting') {
-                            this.connectedIds[target] = 'pending';
-                            this.createPeer(target, true);
-                        }
-                    }, 4000);
+                    this.armFallbackOffer(peerId);
                 }
+            }
+        },
+
+        /**
+         * 给「等待对方发起」的连接挂一个可取消的兜底发起。
+         *
+         * 只有在这段时间内**完全没收到对方 offer** 时才补发，
+         * 否则就是多余的第二次 offer。
+         */
+        armFallbackOffer(peerId) {
+            this.clearFallbackOffer(peerId);
+
+            this.fallbackTimers[peerId] = setTimeout(() => {
+                delete this.fallbackTimers[peerId];
+                if (this.destroyed) return;
+
+                // 期间已收到 offer / 已在协商 / 已连上 —— 不需要补发
+                if (this.connectedIds[peerId] !== 'waiting') return;
+                if (this.peers && Object.values(this.peers).some(p => p._remoteId === peerId)) return;
+
+                console.log('[rtc] 等待 offer 超时，补发起一次:', peerId.slice(0, 6));
+                this.connectedIds[peerId] = 'pending';
+                this.createPeer(peerId, true);
+            }, FALLBACK_OFFER_DELAY);
+        },
+
+        /** 取消某个对端的兜底发起（收到 offer / 已连上时调用）。 */
+        clearFallbackOffer(peerId) {
+            const t = this.fallbackTimers && this.fallbackTimers[peerId];
+            if (t) {
+                clearTimeout(t);
+                delete this.fallbackTimers[peerId];
             }
         },
 
@@ -1307,15 +1563,67 @@ export default {
             // 对方的名字随 offer 的 metadata 送来
             this.rememberPeerName(initiator, metadata);
 
+            // offer 已到，兜底发起不再需要
+            this.clearFallbackOffer(initiator);
+
+            /*
+             * 已经连上了还收到 offer —— 迟到或重复的消息，直接忽略。
+             *
+             * 这不是 glare（glare 是双方都没连上时的对撞）。走到这里说明
+             * 双方已有可用连接，若再走一遍 setRemoteDescription + createAnswer，
+             * 会把正在工作的连接重协商掉，画面闪断。
+             */
+            const live = Object.values(this.peers).find(
+                p => p._remoteId === initiator && p.connectionState === 'connected'
+            );
+            if (live) {
+                console.log('[rtc] 已有可用连接，忽略重复 offer:', initiator.slice(0, 6));
+                return;
+            }
+
+            /*
+             * glare 裁定：双方可能同时发起。
+             *
+             * 场景：A 与 B 同时入房，rediscover 让双方都看到对方，
+             * 各自都判定「我该发起」（或兜底定时器误触发），于是两条
+             * offer 同时存在。若不处理，双方会各自为对方建一个 peer，
+             * 变成 4 个 PeerConnection 抢同一条链路 —— 常见后果是
+             * 两条都停在 connecting，或画面反复闪断。
+             *
+             * 裁定规则与 onDiscover 保持一致：**socket.id 字典序小的一方胜**。
+             * 双方用同一规则、同一份数据判断，结论必然一致，不会出现
+             * 「两边都退让」或「两边都坚持」。
+             */
+            const mine = Object.values(this.peers).find(
+                p => p._remoteId === initiator && p._initiator
+            );
+            if (mine && this.socket && this.socket.id) {
+                const myId = this.socket.id;
+                if (String(myId) < String(initiator)) {
+                    /*
+                     * 我 id 较小：由我发起更优，忽略这条 offer。
+                     *
+                     * 注意**不能**把 connectedIds[initiator] 置成 'answering'——
+                     * 那会让 onDiscover 的「已有标记就跳过」永久生效，
+                     * 我这条发起一旦失败，这个对端就再也连不上。
+                     * 保持 'pending' 即可（我本来就是发起方）。
+                     *
+                     * 对方会发 offer，只有一种可能：他那边「等待对方发起」的
+                     * 兜底超时了 —— 也就是**我先前那条 offer 他没收到**。
+                     * 因此这里必须重发一次，否则双方都在等对方：我等他 answer，
+                     * 他等我 offer，直到 15 秒连接超时才靠 rediscover 自愈。
+                     */
+                    console.log('[rtc] glare：我 id 较小，忽略对方 offer 并重发自己的', initiator.slice(0, 6));
+                    this.sendOffer(mine);
+                    return;
+                }
+                // 对方 id 较小：放弃我这条，改应答对方
+                console.log('[rtc] glare：对方 id 较小，放弃本地发起', initiator.slice(0, 6));
+                this.dropPeer(mine._sid);
+            }
+
             /*
              * 标记「已在应答中」，必须放在最前面。
-             *
-             * 这里防的是**双方同时发起 offer**（glare）：
-             * onDiscover 里 id 较大的一方会等 4 秒再补发，但 offer 从发出
-             * 到 setRemoteDescription 完成可能超过 4 秒（App 端 + 弱网尤其常见），
-             * 于是等待方误判「对方没发」又自己发起一次 —— 两条连接互相打架，
-             * 常见后果是两条都停在 connecting、dataChannel 永远不 open，
-             * 表现为「通话界面正常但同步消息一条都收不到」。
              *
              * 置成非空值即可让 onDiscover 的 `if (this.connectedIds[peerId]) continue`
              * 跳过重复发起（该判断对任意非空值都成立）。
@@ -1326,7 +1634,37 @@ export default {
             if (!peer) {
                 peer = this.createPeer(initiator, false, sessionId);
             }
+
+            /*
+             * 应答流程整体入队执行。
+             *
+             * 它包含 setRemoteDescription + createAnswer + setLocalDescription，
+             * 是一串改状态机的操作 —— 必须与同时到达的 candidate/answer 串行，
+             * 否则并发调用会抛「Called in wrong state」。
+             */
+            await this.runOnPeer(peer, () => this.answerOffer(peer, signal, initiator, sessionId));
+        },
+
+        /**
+         * 应答一条 offer（纯执行函数，由 runOnPeer 串行化后调用）。
+         *
+         * 拆出来是为了避免在队列内部再入队（自我等待会死锁）。
+         */
+        async answerOffer(peer, signal, initiator, sessionId) {
             try {
+                /*
+                 * 已在处理同一条连接的远端 offer 时，重复的 offer 只认最新一条。
+                 *
+                 * 对方兜底重发会带来第二条 offer；若直接 setRemoteDescription，
+                 * 在 have-remote-offer 状态下会抛错。这里显式跳过，
+                 * 因为连接本身没问题 —— 只是对方重复发了。
+                 */
+                if (peer.remoteDescription && peer.remoteDescription.type === 'offer'
+                    && peer.signalingState === 'have-remote-offer') {
+                    console.log('[rtc] 已在处理 offer，忽略重复的一条');
+                    return;
+                }
+
                 await peer.setRemoteDescription(signal);
 
                 /*
@@ -1340,7 +1678,12 @@ export default {
                  * 提前调 applyLocalTracksToPeer 什么也填不进去。
                  */
                 this.promoteSendRecv(peer);
-                if (this.localStream) await this.applyLocalTracksToPeer(peer);
+                /*
+                 * 直接调 doApplyTracks，**不再走 applyLocalTracksToPeer**。
+                 * 本函数（answerOffer）已经在该 peer 的操作队列里，
+                 * 再入队会等待自己前面的任务 —— 也就是当前这个任务，直接死锁。
+                 */
+                if (this.localStream) await this.doApplyTracks(peer);
 
                 // 补投在 offer 之前就到了的候选
                 const pending = peer._pendingCandidates.splice(0);
@@ -1352,6 +1695,7 @@ export default {
 
                 const answer = await peer.createAnswer();
                 await peer.setLocalDescription(answer);
+                if (!this.socket) return;
                 this.socket.emit(EV.signal, {
                     signal: { type: answer.type, sdp: answer.sdp },
                     // 应答也带上自己的名字，否则发起方拿不到对方昵称
@@ -1360,7 +1704,15 @@ export default {
                     target: initiator
                 });
             } catch (e) {
+                /*
+                 * 应答失败同样要丢掉这条连接。
+                 *
+                 * 半成品 peer 留在表里，onDiscover 会判定「已有该对端的连接」
+                 * 而不再尝试，双方就此长期黑屏。丢掉后由 rediscover 重来。
+                 */
+                console.error('[rtc] 应答失败:', (e && e.message) || e);
                 this.emit('error', { message: '应答失败：' + (e && e.message) });
+                this.dropPeer(sessionId);
             }
         },
 
@@ -1384,7 +1736,39 @@ export default {
         /** 收到 answer 或 ICE 候选。 */
         async onSignal({ sessionId, signal, metadata }) {
             const peer = this.peers[sessionId];
-            if (!peer) return;
+
+            /*
+             * peer 还没建好 —— 先暂存，绝不能丢。
+             *
+             * 候选/answer 与 offer 走两条独立通道，网络快时前者会先到。
+             * 旧实现直接 `if (!peer) return`，这条连接的候选就此残缺，
+             * 只能等 ICE 超时（三人及以上并发协商时尤其常见）。
+             *
+             * 暂存后由 createPeer 调 flushEarlySignals 补投。
+             */
+            if (!peer) {
+                if (!this.earlySignals[sessionId]) this.earlySignals[sessionId] = [];
+                // 上限保护：异常对端狂发候选时不让它无限堆积
+                if (this.earlySignals[sessionId].length < 200) {
+                    this.earlySignals[sessionId].push({ signal, metadata });
+                    console.log('[rtc] 信令早到，暂存待补投:', sessionId.slice(0, 6));
+                }
+                return;
+            }
+
+            await this.runOnPeer(peer, () => this.applySignal(peer, signal, metadata));
+        },
+
+        /**
+         * 把单条信令应用到某个 peer。
+         *
+         * 抽出来是为了让「正常路径」与「早到补投」共用同一套处理逻辑 ——
+         * 两处各写一份必然走偏。
+         *
+         * 纯执行函数：**不自己入队**，由调用方决定是否包 runOnPeer。
+         */
+        async applySignal(peer, signal, metadata) {
+            if (!peer || !signal) return;
 
             // 候选：远端描述未就绪时必须先缓存，否则 addIceCandidate 会抛错
             if (signal.candidate) {
@@ -1401,6 +1785,21 @@ export default {
             }
 
             if (signal.type === 'answer') {
+                /*
+                 * answer 到达时本端必须已经 setLocalDescription(offer)。
+                 *
+                 * 早到补投场景下可能还没走到那一步（flushEarlySignals 在
+                 * createPeer 末尾就跑了，而 offer 是在其后的异步块里创建）——
+                 * 此时 setRemoteDescription(answer) 会抛
+                 * 「Failed to set remote answer sdp: Called in wrong state」。
+                 * 因此先存起来，等 offer 落地后由 setLocalDescription 之后补投。
+                 */
+                if (!peer.localDescription || !peer.localDescription.type) {
+                    peer._pendingAnswer = signal;
+                    console.log('[rtc] answer 早于本地 offer，暂存待补投');
+                    return;
+                }
+
                 // 应答方的名字随 answer 送达
                 this.rememberPeerName(peer._remoteId, metadata);
                 try {
@@ -1419,6 +1818,49 @@ export default {
         },
 
         /**
+         * 本地 offer 落地后，补投此前早到的 answer（若有）。
+         *
+         * 与 _pendingCandidates 是同一个思路：把「先到的那条」留住，
+         * 等本端状态就绪再应用。
+         *
+         * ⚠️ 只在 `doOffer` 内部（即已处于该 peer 的操作队列中）调用，
+         * 因此这里**直接调 applySignal，不再 runOnPeer** —— 再次入队会
+         * 等待自己前面的任务完成，而当前任务正是它等待的那个，直接死锁。
+         */
+        async flushPendingAnswer(peer) {
+            const ans = peer && peer._pendingAnswer;
+            if (!ans) return;
+            peer._pendingAnswer = null;
+            console.log('[rtc] 补投早到的 answer');
+            await this.applySignal(peer, ans, null);
+        },
+
+        /** 补投某个 peer 建好之前就到的那批信令。 */
+        async flushEarlySignals(sid) {
+            const queued = this.earlySignals[sid];
+            if (!queued || !queued.length) return;
+            delete this.earlySignals[sid];
+
+            const peer = this.peers[sid];
+            if (!peer) return;
+
+            console.log(`[rtc] 补投早到信令 ${queued.length} 条:`, sid.slice(0, 6));
+
+            /*
+             * **整批**入队，而不是逐条 runOnPeer。
+             *
+             * 逐条的话，每次 await 之间别的操作（比如紧随其后的 sendOffer）
+             * 会插到队列中间，补投顺序被打乱；整批包成一个任务则保持
+             * 「这一批按到达顺序连续处理」的语义。
+             */
+            await this.runOnPeer(peer, async () => {
+                for (const item of queued) {
+                    await this.applySignal(peer, item.signal, item.metadata);
+                }
+            });
+        },
+
+        /**
          * 创建 RTCPeerConnection。
          *
          * @param remoteId  对端 socket id
@@ -1431,6 +1873,8 @@ export default {
             this.peers[sid] = peer;
             peer._remoteId = remoteId;
             peer._sid = sid;
+            /** 本端是否这条连接的发起方（glare 裁定时要据此找出自己发起的连接）。 */
+            peer._initiator = !!initiator;
             /**
              * 远端描述就绪前收到的 ICE 候选。
              *
@@ -1439,6 +1883,14 @@ export default {
              * setRemoteDescription 之后再补投。
              */
             peer._pendingCandidates = [];
+
+            /**
+             * 早于本端 localDescription 到达的 answer。
+             *
+             * 见 applySignal 里对 answer 的处理：早到补投时本端可能还没
+             * setLocalDescription(offer)，直接应用会抛错，故先存这里。
+             */
+            peer._pendingAnswer = null;
 
             /*
              * 数据通道：用来传播放进度等小消息。
@@ -1470,7 +1922,18 @@ export default {
              */
             if (initiator) {
                 this.ensureTransceivers(peer);
-                // 此时 transceiver 已就绪，可以直接把已有流填进去
+                /*
+                 * 装配本地轨道。
+                 *
+                 * 走 runOnPeer 入队（而非直接调 doApplyTracks）：
+                 * 队列保证「先装轨道、再生成 offer」的顺序 —— 若不入队，
+                 * 这里未 await 的 replaceTrack 会与随后入队的 sendOffer
+                 * 并发，offer 生成时 sender 上可能还没有轨道，
+                 * 对端首帧就是黑的。
+                 *
+                 * 调用顺序上它排在 flushEarlySignals / sendOffer 之前
+                 * （见本函数末尾），因此队列里的执行顺序也正确。
+                 */
                 if (this.localStream) this.applyLocalTracksToPeer(peer);
             }
 
@@ -1537,6 +2000,10 @@ export default {
             peer.onconnectionstatechange = () => {
                 const st = peer.connectionState;
                 if (st === 'connected') {
+                    // 连上即撤销所有待触发的清理定时器
+                    this.clearConnectTimer(sid);
+                    this.clearRecoverTimer(sid);
+
                     this.connectedIds[remoteId] = 'ok';
                     this.emit('remote', true);
                     this.reportPeers();
@@ -1544,58 +2011,231 @@ export default {
                     this.ensureTile(remoteId);
                     this.syncGridLayout();
                     if (this.waitEl) this.waitEl.classList.add('is-hidden');
-                } else if (st === 'failed' || st === 'closed' || st === 'disconnected') {
-                    delete this.connectedIds[remoteId];
-                    this.reportPeers();
-                    this.removeTile(remoteId);
-                    this.syncGridLayout();
+                } else if (st === 'failed' || st === 'closed') {
+                    /*
+                     * 连接彻底失效：整条清掉，并**允许后续重新建连**。
+                     *
+                     * 旧实现只删 connectedIds 与画面格，peers/channels 里的
+                     * 死连接却留着 —— 于是 onDiscover 的
+                     * 「已存在同 remoteId 的 peer 就跳过」永远成立，
+                     * 这个对端再也连不回来（表现为「有人退出后重进，别人看不到他」）。
+                     */
+                    this.dropPeer(sid);
 
                     /*
                      * 多人场景：一条连接断开不代表「所有人都走了」，
                      * 只有再没有任何 connected 的对端时才算全部离开。
                      */
                     const stillAlive = Object.values(this.peers).some(
-                        p => p !== peer && p.connectionState === 'connected'
+                        p => p.connectionState === 'connected'
                     );
                     if (!stillAlive) {
                         this.emit('remote', false);
                         if (this.waitEl) this.waitEl.classList.remove('is-hidden');
                     }
+                } else if (st === 'disconnected') {
+                    /*
+                     * disconnected 是**可自愈**的瞬时状态（网络抖动、切前后台），
+                     * 内核通常能自行恢复。这里先摘掉「已连上」标记，
+                     * 免得同步/人数统计把它算作在线；但不清连接。
+                     *
+                     * 同时挂一个兜底：部分内核不会把它推进到 failed，
+                     * 会长期停在 disconnected —— 那这条连接其实已经废了，
+                     * 不清理就再也重建不起来。超时后仍未恢复即按失效处理。
+                     */
+                    if (this.connectedIds[remoteId] === 'ok') {
+                        delete this.connectedIds[remoteId];
+                        this.reportPeers();
+                    }
+
+                    /*
+                     * 兜底定时器**先清后挂**，避免状态抖动时累积。
+                     *
+                     * disconnected 可能来回跳变（抖一下断、又恢复），
+                     * 每跳一次就挂一个 8 秒定时器的话，会同时存在多个；
+                     * 它们各自触发时都要重新判断状态，白白多跑。
+                     * 用同一张表记账，保证一个对端最多只有一个在飞。
+                     */
+                    this.clearRecoverTimer(sid);
+                    this.recoverTimers[sid] = setTimeout(() => {
+                        delete this.recoverTimers[sid];
+                        if (this.destroyed) return;
+                        if (this.peers[sid] !== peer) return;
+                        if (peer.connectionState === 'disconnected') {
+                            console.warn('[rtc] 连接长时间未恢复，按失效处理:', sid.slice(0, 6));
+                            this.dropPeer(sid);
+                        }
+                    }, RECOVER_TIMEOUT);
                 }
             };
 
+            /*
+             * 先补投这条连接建好之前就到的那批信令，**再发 offer**。
+             *
+             * 顺序很关键：早到的 answer 在此时 localDescription 还是空的，
+             * 会被 applySignal 存进 _pendingAnswer，随后由 doOffer 里
+             * setLocalDescription 之后的 flushPendingAnswer 正确补投。
+             * 若反过来先发 offer，补投的 answer 会直接撞进 setRemoteDescription，
+             * 走上一条依赖运行时状态判断的脆弱路径。
+             *
+             * 两者都经 runOnPeer 入队，因此实际执行顺序与调用顺序一致。
+             */
+            this.flushEarlySignals(sid);
+
             // 发起方：创建 offer（首帧 offer 走 offer 事件，其余走 signal）
             if (initiator) {
-                (async () => {
-                    try {
-                        const offer = await peer.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-                        await peer.setLocalDescription(offer);
-                        this.socket.emit(EV.offer, {
-                            signal: { type: offer.type, sdp: offer.sdp },
-                            metadata: { name: this.conf.displayName || '' },
-                            sessionId: sid,
-                            target: remoteId
-                        });
-                        this.startConnectTimer(sid);
-                    } catch (e) {
-                        this.emit('error', { message: '发起通话失败：' + (e && e.message) });
-                    }
-                })();
+                this.sendOffer(peer);
             }
 
             return peer;
         },
 
-        /** 连接超时保护：迟迟连不上就重试一次。 */
+        /**
+         * 创建并发出 offer。
+         *
+         * 抽成方法是为了让「首次发起」与「glare 后重发」共用同一套逻辑 ——
+         * 重发时若漏掉 setLocalDescription 或漏发，双方就会互相等对方到超时。
+         *
+         * 入队执行：createOffer / setLocalDescription / flushPendingAnswer
+         * 都在改状态机，必须与同时到达的信令串行。
+         */
+        sendOffer(peer) {
+            return this.runOnPeer(peer, () => this.doOffer(peer));
+        },
+
+        /** 真正创建并发出 offer（纯执行函数）。 */
+        async doOffer(peer) {
+            if (!peer || this.destroyed) return;
+            try {
+                const offer = await peer.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: true
+                });
+                await peer.setLocalDescription(offer);
+
+                /*
+                 * offer 落地后立刻补投早到的 answer。
+                 *
+                 * 对方可能已经回包，而回包因本端尚无 localDescription
+                 * 被暂存在 _pendingAnswer 里。
+                 */
+                await this.flushPendingAnswer(peer);
+
+                if (!this.socket) return;
+                this.socket.emit(EV.offer, {
+                    signal: { type: offer.type, sdp: offer.sdp },
+                    metadata: { name: this.conf.displayName || '' },
+                    sessionId: peer._sid,
+                    target: peer._remoteId
+                });
+                this.startConnectTimer(peer._sid);
+            } catch (e) {
+                /*
+                 * 发起失败要**把这条连接整个丢掉**。
+                 *
+                 * 只报错不清理的话，connectedIds[remoteId] 会停在
+                 * 'pending'，而 onDiscover 看到非空值就跳过 ——
+                 * 这个对端再也不会被重新发起（表现为「某人一直看不到画面」）。
+                 * 丢掉之后下一轮 rediscover 会重新裁定并建连。
+                 */
+                console.error('[rtc] 发起 offer 失败:', (e && e.message) || e);
+                this.emit('error', { message: '发起通话失败：' + (e && e.message) });
+                this.dropPeer(peer._sid);
+            }
+        },
+
+        /**
+         * 彻底丢弃一条连接。
+         *
+         * 必须把 peers / channels / connectedIds / 画面格 / 兜底定时器
+         * **一起**清掉，任何一处残留都会让该对端无法重新建连：
+         *   · peers 残留 → onDiscover 判定「已有该对端的连接」而跳过
+         *   · channels 残留 → broadcast 会往死通道发，永远 sent=0
+         *   · connectedIds 残留 → 该对端被算作在线，人数虚高
+         */
+        dropPeer(sid) {
+            const peer = this.peers[sid];
+            const remoteId = peer && peer._remoteId;
+
+            /*
+             * **先摘除，再 close** —— 顺序不能反。
+             *
+             * `peer.close()` 会**同步**把 connectionState 置为 'closed' 并触发
+             * onconnectionstatechange，而那个回调又会调 dropPeer(sid)。
+             * 若此时 peers[sid] 还在，就会无限递归（栈溢出直接崩掉 renderjs）。
+             * 先 delete 之后，重入的那次拿不到 peer，走空路径安全返回。
+             */
+            delete this.peers[sid];
+            if (peer) {
+                try { peer.close(); } catch (e) { /* 忽略 */ }
+            }
+
+            delete this.channels[sid];
+            delete this.earlySignals[sid];
+            // 连接已丢，超时定时器必须一并取消（成熟库 _closePeer 同样如此）
+            this.clearConnectTimer(sid);
+            this.clearRecoverTimer(sid);
+
+            if (remoteId) {
+                delete this.connectedIds[remoteId];
+                this.clearFallbackOffer(remoteId);
+                this.removeTile(remoteId);
+            }
+
+            this.reportPeers();
+            this.syncGridLayout();
+        },
+
+        /**
+         * 连接超时保护：迟迟连不上就整条清掉，交给下一轮 discover 重建。
+         *
+         * 定时器**按 sessionId 记账**（见 connectTimers），重复调用会先清旧的。
+         * 成熟库（simple-signal-client）同样用 `_timers` Map + `_clearTimer`
+         * 管理 —— 裸 setTimeout 在重发/重连场景会累积出多个定时器，
+         * 各自在 15 秒后触发，把已经重建好的连接误清掉。
+         */
         startConnectTimer(sid) {
             const peer = this.peers[sid];
             if (!peer) return;
-            setTimeout(() => {
+
+            this.clearConnectTimer(sid);
+
+            this.connectTimers[sid] = setTimeout(() => {
+                delete this.connectTimers[sid];
                 if (this.destroyed) return;
-                if (peer.connectionState !== 'connected') {
-                    delete this.connectedIds[peer._remoteId];
-                }
+                // 这条连接已被替换或清理，什么都不做
+                if (this.peers[sid] !== peer) return;
+                if (peer.connectionState === 'connected') return;
+
+                /*
+                 * 超时未连上：**必须整条清掉**，不能只删 connectedIds。
+                 *
+                 * 只删标记的话，peers 里那条死连接还在，onDiscover 的
+                 * 「已有同 remoteId 的 peer 就跳过」永远成立 ——
+                 * 这个对端再也连不回来。清掉之后，下一轮 rediscover（3 秒）
+                 * 会重新按字典序裁定并建连，形成自愈。
+                 */
+                console.warn('[rtc] 连接超时未建立，清理后待重连:', sid.slice(0, 6));
+                this.dropPeer(sid);
             }, CONNECT_TIMEOUT);
+        },
+
+        /** 取消某个 sessionId 的连接超时定时器。 */
+        clearConnectTimer(sid) {
+            const t = this.connectTimers && this.connectTimers[sid];
+            if (t) {
+                clearTimeout(t);
+                delete this.connectTimers[sid];
+            }
+        },
+
+        /** 取消某个 sessionId 的 disconnected 恢复兜底定时器。 */
+        clearRecoverTimer(sid) {
+            const t = this.recoverTimers && this.recoverTimers[sid];
+            if (t) {
+                clearTimeout(t);
+                delete this.recoverTimers[sid];
+            }
         },
 
         /* ---------------- 数据通道（播放同步） ---------------- */
@@ -1623,6 +2263,19 @@ export default {
             };
             channel.onclose = () => {
                 delete this.channels[peer._sid];
+
+                /*
+                 * 同步摘掉「已连上」标记。
+                 *
+                 * dataChannel 关闭说明这条链路已经不能传消息了，但
+                 * PeerConnection 的 connectionState 未必立刻变 —— 不同步的话
+                 * 人数与同步状态会虚高（显示「3 人同看」实际只剩 2 人）。
+                 * 真正失效仍由 onconnectionstatechange 走 dropPeer 收尾。
+                 */
+                if (peer._remoteId && this.connectedIds[peer._remoteId] === 'ok') {
+                    delete this.connectedIds[peer._remoteId];
+                    this.reportPeers();
+                }
             };
             channel.onerror = () => { /* 忽略 */ };
         },
@@ -1651,8 +2304,53 @@ export default {
                 return false;
             }
 
+            const sent = this.sendToChannels(text);
+            if (sent > 0) return true;
+
+            const sids = Object.keys(this.channels);
+
+            /*
+             * 一个通道都没有 —— 信令或建连还没起来，这是真问题。
+             */
+            if (!sids.length) {
+                this.emit('broadcastfail', { reason: 'nochannel' });
+                return false;
+            }
+
+            /*
+             * 有通道但还在协商中（connecting）—— 这是**正常过渡态**。
+             *
+             * 对端刚接入时，connectionState 先变 connected、dataChannel 才
+             * 随后 open，两者相隔可能几百毫秒。而房主的广播是 3 秒轮播，
+             * 正好撞上这个窗口就会报一次「房间同步未建立」，
+             * 紧接着又打「同步通道已打开」—— 用户看到提示闪一下，纯噪音。
+             *
+             * 处理：等一小会儿补发一次。成功就说明只是晚了，
+             * 连首条消息都不会丢；仍失败才如实报警。
+             */
+            const connecting = sids.some(sid => {
+                const ch = this.channels[sid];
+                return ch && ch.readyState === 'connecting';
+            });
+
+            if (connecting) {
+                setTimeout(() => {
+                    if (this.destroyed) return;
+                    if (this.sendToChannels(text) === 0) {
+                        this.emit('broadcastfail', { reason: 'notopen' });
+                    }
+                }, 800);
+                return false;
+            }
+
+            this.emit('broadcastfail', { reason: 'notopen' });
+            return false;
+        },
+
+        /** 把一条已序列化的消息发往所有 open 的通道，返回成功条数。 */
+        sendToChannels(text) {
             let sent = 0;
-            for (const sid of Object.keys(this.channels)) {
+            for (const sid of Object.keys(this.channels || {})) {
                 const ch = this.channels[sid];
                 try {
                     if (ch && ch.readyState === 'open') {
@@ -1661,19 +2359,7 @@ export default {
                     }
                 } catch (e) { /* 忽略单个通道失败 */ }
             }
-
-            if (sent === 0) {
-                /*
-                 * 区分两种情形，便于定位：
-                 *   nochannel —— 一个 PeerConnection 都还没建起来（信令问题）
-                 *   notopen   —— 连上了但 dataChannel 还没 open（协商中）
-                 */
-                this.emit('broadcastfail', {
-                    reason: Object.keys(this.channels).length ? 'notopen' : 'nochannel'
-                });
-                return false;
-            }
-            return true;
+            return sent;
         },
 
         /** 广播播放状态（房主用）。 */
@@ -1729,6 +2415,25 @@ export default {
         removeTile(peerId) {
             const tile = this.tiles[peerId];
             if (!tile) return;
+
+            /*
+             * 先摘掉轨道监听再释放。
+             *
+             * `_redraw` 被挂在每条 track 的 mute/unmute/ended 上，不清掉的话
+             * 该对端重新入房、轨道换新后，旧监听仍指向已移除的 DOM 节点 ——
+             * 会在 track 事件里操作游离节点，是「重进房间后画面错乱」的来源之一。
+             */
+            if (tile._boundTracks) {
+                for (const track of tile._boundTracks) {
+                    try {
+                        track.removeEventListener('mute', tile._redraw);
+                        track.removeEventListener('unmute', tile._redraw);
+                        track.removeEventListener('ended', tile._redraw);
+                    } catch (e) { /* 忽略 */ }
+                }
+                tile._boundTracks.clear();
+            }
+
             // 明确释放：不解除 srcObject 时 video 会一直持有 MediaStream
             try {
                 tile.video.srcObject = null;
@@ -1881,20 +2586,41 @@ export default {
                 const newTrack = newStream.getVideoTracks()[0];
                 if (!newTrack) return;
 
-                // 替换本地预览
-                this.localStream.removeTrack(videoTrack);
+                /*
+                 * 替换本地预览。
+                 *
+                 * 必须先 addTrack 再 removeTrack：反过来的话，中间那一瞬
+                 * localStream 里没有任何视频轨，而 localVideoEl.srcObject
+                 * 正是这个流 —— 部分 WebView 会因此把画面元素判定为「无源」
+                 * 并停止渲染，之后即使轨道回来了也不再恢复（黑屏）。
+                 */
                 this.localStream.addTrack(newTrack);
+                this.localStream.removeTrack(videoTrack);
                 videoTrack.stop();
                 if (this.localVideoEl) {
                     this.localVideoEl.srcObject = this.localStream;
                     await this.localVideoEl.play().catch(() => {});
                 }
 
-                // 替换所有对端发送轨道
+                /*
+                 * 替换所有对端发送轨道。
+                 *
+                 * **逐个 await 且必须 await** —— 旧实现虽然写了 await，
+                 * 但循环里任何一次 replaceTrack 抛错都会被外层 catch 吞掉，
+                 * 于是后面几路对端**根本没换**：房主切了前后摄像头，
+                 * 自己画面变了，部分观众看到的还是旧镜头，且没有任何提示。
+                 * 这里改为逐条捕获，单路失败不影响其余对端。
+                 */
                 for (const sid of Object.keys(this.peers)) {
                     const peer = this.peers[sid];
+                    if (!peer || typeof peer.getSenders !== 'function') continue;
                     const sender = peer.getSenders().find(s => s.track && s.track.kind === 'video');
-                    if (sender) await sender.replaceTrack(newTrack);
+                    if (!sender) continue;
+                    try {
+                        await sender.replaceTrack(newTrack);
+                    } catch (e) {
+                        console.warn('[rtc] 某路对端换摄像头轨道失败:', (e && e.message) || e);
+                    }
                 }
                 this.emit('camera', next);
             } catch (e) {
@@ -1921,14 +2647,55 @@ export default {
             this.stopRediscover();
 
             // 关闭所有 PeerConnection
+            /*
+             * **先摘回调再关闭**。
+             *
+             * close() 会同步触发 onconnectionstatechange('closed')，那个回调
+             * 会调 dropPeer —— 而 cleanup 期间各表正在被清空，重入进去会
+             * 在已半清的状态上操作（且 reportPeers/syncGridLayout 都会白跑）。
+             * 把回调摘掉，关闭就变成纯资源释放。
+             */
             for (const sid of Object.keys(this.peers)) {
+                const p = this.peers[sid];
+                if (!p) continue;
                 try {
-                    this.peers[sid].close();
+                    p.onconnectionstatechange = null;
+                    p.ontrack = null;
+                    p.onicecandidate = null;
+                    p.ondatachannel = null;
+                    p.close();
                 } catch (e) { /* 忽略 */ }
             }
             this.peers = {};
             this.connectedIds = {};
             this.channels = {};
+
+            /*
+             * 早到信令暂存与兜底定时器同样要清。
+             *
+             * 定时器不清会在页面卸载后触发，此时 socket 已置 null、
+             * destroyed 已为 true，虽被守卫拦住，但白白留一堆悬挂回调。
+             */
+            this.earlySignals = {};
+            for (const id of Object.keys(this.fallbackTimers || {})) {
+                this.clearFallbackOffer(id);
+            }
+            this.fallbackTimers = {};
+
+            /*
+             * 连接超时 / 恢复兜底定时器同样要清。
+             *
+             * 不清的话，页面卸载后它们仍会触发 —— 虽然 destroyed 守卫能拦住，
+             * 但每次重进房间都会累积一批悬挂回调，久了白白占资源。
+             */
+            for (const sid of Object.keys(this.connectTimers || {})) {
+                this.clearConnectTimer(sid);
+            }
+            this.connectTimers = {};
+            for (const sid of Object.keys(this.recoverTimers || {})) {
+                this.clearRecoverTimer(sid);
+            }
+            this.recoverTimers = {};
 
             // 移除所有对端画面格（不解除 srcObject 会让 video 一直持有流）
             for (const peerId of Object.keys(this.tiles)) {
@@ -1944,6 +2711,20 @@ export default {
                 this.localStream = null;
             }
             if (this.localVideoEl) this.localVideoEl.srcObject = null;
+
+            /*
+             * 复位媒体标记，避免影响下一次 start（组件被复用、页面重进房）。
+             *
+             * 顺序上必须**先取消、后复位**：
+             *   · `mediaCancelled = true` 让仍在飞的取流拿到结果后自行丢弃，
+             *     否则它会把手里的流装上，而新一轮又取一条 —— 前一条永不释放。
+             *   · 随后清掉 `mediaTask`，使下一轮 startMedia 不再复用旧 Promise。
+             *
+             * `mediaCancelled` 不在这里复位成 false：它的复位归 startMedia
+             * （每次「开启」时清一次），本处代表「取消」，语义不能反过来。
+             */
+            this.mediaCancelled = true;
+            this.mediaTask = null;
 
             // 断开信令
             if (this.socket) {
