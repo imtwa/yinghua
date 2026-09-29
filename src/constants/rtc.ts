@@ -1,15 +1,19 @@
 /**
  * 视频通话信令配置。
  *
+ * ⚠️ **本文件不参与运行**。
+ *
+ * 通话的实质逻辑跑在 `components/yh-rtc/yh-rtc.vue` 的 **renderjs** 段，
+ * 而 renderjs 不能 `import` —— 因此信令地址、ICE 列表、事件名常量
+ * 在那边**各存了一份**，实际生效的是那一份。本文件仅作参考与类型说明，
+ * 改动时必须两边同步，否则会出现「改了没生效」的困惑。
+ *
  * ## 服务端
  *
- * 复用毕业设计（`exam-interview`）在线的信令服务：
- * `weston-vue-webrtc-lobby.azurewebsites.net`（socket.io v4）。
- *
- * 已实测（2026-09）：
- *   - `GET /` 返回 `Lobby server<br/>rooms: N<br/>members: N`
- *   - `EIO=4` 握手成功、`EIO=3` 返回 400 → 服务端为 socket.io v4
- *   - 事件名与 simple-signal 协议一致（见下）
+ * 自建服务见仓库 `deploy/` 目录（信令 + coturn 一键部署）。
+ * 此前借用的 `weston-vue-webrtc-lobby.azurewebsites.net` 在海外且不稳定
+ * （实测频繁 `信令连接失败：timeout`），现已改为可配置：
+ * 页面从 `VITE_RTC_SIGNAL_URL` 读地址、经 prop 传入 renderjs。
  *
  * ## 协议（实测抓包确认）
  *
@@ -33,7 +37,7 @@
  *      通话页因此采用「定时 rediscover」+「入房即双向 discover」。
  */
 
-/** 信令服务地址。 */
+/** 内置信令服务地址（兜底）。生产环境应改用 `VITE_RTC_SIGNAL_URL`。 */
 export const SIGNAL_URL = 'https://weston-vue-webrtc-lobby.azurewebsites.net';
 
 /** 事件名常量（与服务端约定，不可改动）。 */
@@ -56,26 +60,23 @@ export const REDISCOVER_INTERVAL = 3000;
 export const CONNECT_TIMEOUT = 15000;
 
 /**
- * ICE 服务器配置。
+ * 兜底 STUN 列表。
  *
- * ## 为什么要多个 STUN
+ * ## 只有 STUN 是不够的
  *
- * STUN 只用来「发现自己的公网地址」（srflx 候选）。两端都拿到公网地址后，
- * 多数家庭宽带下可直接 P2P 打通，不必依赖 TURN 中转。
+ * STUN 仅用于「发现自己的公网地址」（srflx 候选）。两端都拿到公网地址后，
+ * 简单 NAT 下可直接 P2P 打通，但**对称型 NAT / CGNAT 下打洞必然失败** ——
+ * 此时唯一出路是 TURN 中继，而国内移动网络几乎都是这种情况。
  *
- * 但单个 STUN 服务器并不总是可达 —— 本机实测（2026-09）：
+ * 因此本工程的实际做法是：由信令服务的 `/rtc-config` 在**运行时**下发
+ * ICE 列表（含 TURN 临时凭据），本数组只作拉取失败时的兜底。
+ *
+ * ## 为什么并列多个 STUN
+ *
+ * 单个服务器不一定可达 —— 实测：
  *   stun.l.google.com / stun1.l.google.com / stun.miwifi.com / stun.chat.bilibili.com  可达
  *   stun.qq.com:3478                                                                  超时
- * 因此这里**并列多个**，浏览器/WebView 会并发查询，任一成功即可。
- * 只配一个的话，那个正好不通就收集不到公网候选，
- * 双方都只有内网地址（srflx 缺失），跨网络连接直接失败。
- *
- * ## 关于 TURN
- *
- * 严格对称型 NAT 或企业网络下，P2P 仍可能打不通，此时必须有 TURN 中转。
- * 公共免费 TURN 稀缺且不稳定，故本工程不内置 ——
- * 若你的场景需要跨复杂网络，请自建 coturn 并在此追加：
- *   { urls: 'turn:你的主机:3478', username: '...', credential: '...' }
+ * 因此并列多个，任一成功即可。
  */
 export const ICE_SERVERS: RTCIceServer[] = [
     // Google 公共 STUN：用于发现公网地址

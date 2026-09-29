@@ -86,6 +86,8 @@
                 :display-name="displayName"
                 :auto-start="true"
                 :media-on="callEnabled"
+                :signal-url="RTC_SIGNAL_URL"
+                :ice-config-url="RTC_ICE_CONFIG_URL"
                 @status="onCallStatus"
                 @remote="onRemoteChange"
                 @peers="onPeersChange"
@@ -355,6 +357,31 @@ import {
 } from '@/utils/room-sync';
 
 const log = createLogger('room');
+
+/**
+ * 通话服务地址（来自环境变量）。
+ *
+ * ## 为什么在这里读、再用 prop 传下去
+ *
+ * `yh-rtc` 的实质逻辑跑在 **renderjs** 段，那里**不能 import**，
+ * 也读不到 `import.meta.env`。因此只能在逻辑层读好、经 prop 送进去。
+ *
+ * ## 留空的后果
+ *
+ * 信令会退回内置的公共 lobby 服务（海外、不稳定）；
+ * ICE 配置接口留空则只使用内置 STUN —— 同一 WiFi 能通话，
+ * 但换到移动网络/别人手机就必然连不通（对称型 NAT 无法打洞）。
+ * 完整服务见仓库 `deploy/` 目录。
+ */
+const RTC_SIGNAL_URL = (import.meta.env.VITE_RTC_SIGNAL_URL || '').trim();
+const RTC_ICE_CONFIG_URL = (import.meta.env.VITE_RTC_ICE_CONFIG_URL || '').trim();
+
+if (!RTC_SIGNAL_URL) {
+    log.warn('未配置 VITE_RTC_SIGNAL_URL，将使用内置公共信令服务（不稳定）');
+}
+if (!RTC_ICE_CONFIG_URL) {
+    log.warn('未配置 VITE_RTC_ICE_CONFIG_URL，仅使用 STUN —— 跨网络通话将无法建立');
+}
 
 const playStore = usePlayStore();
 const userStore = useUserStore();

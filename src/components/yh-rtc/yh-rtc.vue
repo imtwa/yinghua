@@ -48,7 +48,30 @@ export default {
          * 默认 false：进房间不主动弹摄像头权限，用户点了「开启视频通话」
          * 才采集。
          */
-        mediaOn: { type: Boolean, default: false }
+        mediaOn: { type: Boolean, default: false },
+        /**
+         * 信令服务地址。
+         *
+         * 由页面从环境变量注入（见 room.vue），**不写死在 renderjs 里** ——
+         * renderjs 段不能 import，拿不到 `import.meta.env`，
+         * 因此地址必须经这个 prop 传进去。
+         *
+         * 留空时退回内置默认值（renderjs 里的 DEFAULT_SIGNAL_URL），
+         * 保证不配环境变量也能跑起来。
+         */
+        signalUrl: { type: String, default: '' },
+        /**
+         * ICE 配置接口地址。
+         *
+         * 指向信令服务的 `/rtc-config`，用于**运行时**取回 TURN 临时凭据。
+         *
+         * 为什么不在构建期写死 TURN 地址与密钥：
+         *   · 临时凭据有有效期，写死会导致过期后必须重新发版
+         *   · 密钥一旦进包就等于公开，中继带宽会被白嫖
+         * 留空时只用内置 STUN，跨网络可能连不通（表现为「同 WiFi 能打、
+         * 换手机不行」）。
+         */
+        iceConfigUrl: { type: String, default: '' }
     },
     data() {
         return {
@@ -104,7 +127,15 @@ export default {
                 autoStart: this.autoStart,
                 initialVideo: this.initialVideo,
                 initialAudio: this.initialAudio,
-                mediaOn: this.mediaOn
+                mediaOn: this.mediaOn,
+                /*
+                 * 信令与 ICE 配置接口地址。
+                 *
+                 * 必须放进 config：renderjs 段不能 import，也读不到 props，
+                 * 只能靠这条属性同步通道拿到。
+                 */
+                signalUrl: this.signalUrl,
+                iceConfigUrl: this.iceConfigUrl
             };
         }
     },
@@ -288,7 +319,16 @@ const EV = {
     reject: 'simple-signal[reject]'
 };
 
-const SIGNAL_URL = 'https://weston-vue-webrtc-lobby.azurewebsites.net';
+/**
+ * 内置信令地址（兜底）。
+ *
+ * 正常应由页面经 `signalUrl` prop 注入自建服务地址；留空时退回这里，
+ * 保证未配环境变量时仍能启动。
+ *
+ * 注意这个公共 lobby 服务在海外且不稳定（实测频繁 timeout），
+ * 生产环境务必换成自建地址（见 deploy/ 目录）。
+ */
+const DEFAULT_SIGNAL_URL = 'https://weston-vue-webrtc-lobby.azurewebsites.net';
 const REDISCOVER_INTERVAL = 3000;
 const CONNECT_TIMEOUT = 15000;
 
@@ -308,21 +348,29 @@ const FALLBACK_OFFER_DELAY = 6000;
  */
 const RECOVER_TIMEOUT = 8000;
 
-/*
- * ICE 服务器。
+/**
+ * 兜底 STUN 列表。
  *
- * renderjs 不能 import，因此这里与 constants/rtc.ts **各存一份** ——
- * 修改时必须两处同步，否则实际生效的是这一份。
+ * **只含 STUN，不含 TURN** —— STUN 只能「发现公网地址」，无法在打洞失败时
+ * 中转媒体。国内移动网络多为对称型 NAT / CGNAT，打洞基本不会成功，
+ * 因此仅靠这些 STUN 时只有同一网络（走 host 候选）能互通，
+ * 换到别人手机/移动网络必然连不上。
  *
- * 配置多个 STUN 的原因见 constants/rtc.ts 的注释：单个服务器不一定可达，
- * 本机实测 stun.qq.com 就超时，只配它会导致收集不到公网候选。
+ * 真正解决跨网络要靠 TURN，其地址与临时凭据由信令服务的 /rtc-config 下发
+ * （见 fetchIceServers）。这里的列表是拉取失败时的兜底。
+ *
+ * renderjs 不能 import，因此与 constants/rtc.ts 各存一份；那份仅作参考，
+ * **实际生效的是这一份**。
  */
-const ICE_SERVERS = [
+const FALLBACK_ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.miwifi.com:3478' },
     { urls: 'stun:stun.chat.bilibili.com:3478' }
 ];
+
+/** ICE 配置缓存时长（毫秒）。凭据有效期通常数小时，这里提前 10 分钟失效。 */
+const ICE_CACHE_TTL = 10 * 60 * 1000;
 
 const CSS_TEXT = `
 .rtc-box { position: relative; width: 100%; height: 100%; background: #0b0d10; overflow: hidden; }
@@ -448,7 +496,19 @@ export default {
             /** 是否正在监听设备 */
             running: false,
             /** 固化后的房间名（由 waitRoomId 落定，避免 conf 后续被覆盖） */
-            roomIdFixed: ''
+            roomIdFixed: '',
+            /**
+             * 本次会话实际使用的 ICE 服务器列表。
+             *
+             * 由 fetchIceServers 从信令服务拉取（含 TURN 临时凭据），
+             * 失败时退回 FALLBACK_ICE_SERVERS。createPeer 建连时读它 ——
+             * 若继续读常量，TURN 永远不会生效。
+             */
+            iceServers: null,
+            /** ICE 配置的拉取时间，用于缓存过期判断 */
+            iceFetchedAt: 0,
+            /** 是否已取到带 TURN 的配置（用于区分「只走 STUN」的降级状态） */
+            iceHasTurn: false
         };
     },
     computed: {
@@ -1385,6 +1445,80 @@ export default {
             this.emit('localready', { media: false, hasVideo: false, hasAudio: false });
         },
 
+        /**
+         * 本次会话使用的信令地址。
+         *
+         * 优先用页面注入的 `conf.signalUrl`；未注入时退回内置默认值。
+         * 之所以每次现读而不是启动时固化：conf 由 renderjs 属性同步送达，
+         * 首帧可能还是空串（与房间号同理，见 waitRoomId）。
+         */
+        signalUrl() {
+            const u = (this.conf && this.conf.signalUrl) || '';
+            return u || DEFAULT_SIGNAL_URL;
+        },
+
+        /**
+         * 拉取 ICE 配置（含 TURN 临时凭据）。
+         *
+         * ## 为什么走 HTTP 而不是构建期写死
+         *
+         * TURN 凭据是**临时**的（由信令服务按 HMAC 签发、带过期时间）。
+         * 写进包里有三个问题：过期后必须重新发版；密钥等于公开，中继带宽会被白嫖；
+         * renderjs 段不能 import，本来也读不到构建期变量。
+         *
+         * ## 失败不阻断
+         *
+         * 拉取失败只退回纯 STUN —— 同一网络下仍能通话，只是跨网络打不通。
+         * 这里必须显式打出日志，否则「只能同 WiFi 用」会没有任何线索。
+         */
+        async fetchIceServers() {
+            // 缓存未过期则复用，避免每次建连都多一次请求
+            if (this.iceServers && Date.now() - this.iceFetchedAt < ICE_CACHE_TTL) {
+                return this.iceServers;
+            }
+
+            const base = (this.conf && this.conf.iceConfigUrl) || '';
+            if (!base) {
+                console.warn('[rtc] 未配置 ICE 配置接口，仅使用 STUN —— 跨网络可能连不通');
+                this.iceServers = FALLBACK_ICE_SERVERS;
+                this.iceFetchedAt = Date.now();
+                return this.iceServers;
+            }
+
+            const url = base.replace(/\/+$/, '') + '/rtc-config';
+            try {
+                const res = await fetch(url, {
+                    method: 'GET',
+                    headers: { 'X-Client-Id': (this.conf && this.conf.displayName) || 'guest' }
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+                const data = await res.json();
+                const list = (data && data.iceServers) || [];
+                if (!Array.isArray(list) || !list.length) {
+                    throw new Error('返回的 iceServers 为空');
+                }
+
+                this.iceServers = list;
+                this.iceFetchedAt = Date.now();
+                this.iceHasTurn = list.some(s => {
+                    const u = Array.isArray(s.urls) ? s.urls.join(' ') : String(s.urls || '');
+                    return u.indexOf('turn:') === 0 || u.indexOf('turn:') > -1 || u.indexOf('turns:') > -1;
+                });
+
+                console.log(`[rtc] ICE 配置已获取：${list.length} 组，TURN ${this.iceHasTurn ? '已启用' : '未启用'}`);
+                if (!this.iceHasTurn) {
+                    console.warn('[rtc] 服务端未下发 TURN —— 对称型 NAT / 移动网络下将无法建立连接');
+                }
+                return this.iceServers;
+            } catch (e) {
+                console.warn('[rtc] 拉取 ICE 配置失败，退回纯 STUN：', (e && e.message) || e);
+                this.iceServers = FALLBACK_ICE_SERVERS;
+                this.iceFetchedAt = Date.now();
+                return this.iceServers;
+            }
+        },
+
         async connectSignal() {
             const io = await this.loadSocketIO();
             if (!io) throw new Error('socket.io 未就绪');
@@ -1400,7 +1534,18 @@ export default {
             if (!roomId) throw new Error('缺少房间号');
             this.roomIdFixed = roomId;
 
-            this.socket = io(SIGNAL_URL, {
+            /*
+             * ICE 配置与信令**并行**拉取。
+             *
+             * 两者互不依赖，串行会让首帧连接白白多等一个 RTT；
+             * 且 ICE 配置失败不影响信令（房间同步仍要走信令）。
+             */
+            this.fetchIceServers().catch(() => {});
+
+            const url = this.signalUrl();
+            console.log('[rtc] 连接信令服务:', url);
+
+            this.socket = io(url, {
                 transports: ['websocket', 'polling'],
                 reconnection: true,
                 timeout: 12000
@@ -1869,7 +2014,16 @@ export default {
          */
         createPeer(remoteId, initiator, sessionId) {
             const sid = sessionId || ('s' + Math.random().toString(36).slice(2, 10));
-            const peer = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+            /*
+             * ICE 服务器取**运行时**那份（含 TURN 临时凭据），而不是常量。
+             *
+             * 若配置尚未拉回（fetchIceServers 与建连并行），先用兜底列表 ——
+             * 同一网络下靠 host 候选即可打通；跨网络场景则要等 TURN 到位，
+             * 这也是为什么 fetchIceServers 在 connectSignal 里就提前发起。
+             */
+            const iceServers = this.iceServers || FALLBACK_ICE_SERVERS;
+            const peer = new RTCPeerConnection({ iceServers });
             this.peers[sid] = peer;
             peer._remoteId = remoteId;
             peer._sid = sid;
@@ -1940,13 +2094,56 @@ export default {
             // ICE 候选：边收集边发（trickle）
             peer.onicecandidate = e => {
                 if (e.candidate && this.socket) {
+                    /*
+                     * 记录候选类型，这是判断「为什么连不通」的唯一依据：
+                     *   host   —— 内网地址，同一 WiFi 下靠它就能通
+                     *   srflx  —— STUN 问出的公网地址，跨网络打洞的基础
+                     *   relay  —— TURN 中继地址，打洞失败时的唯一出路
+                     *
+                     * 只有 host 没有 srflx：STUN 不可达（或被墙）。
+                     * 有 srflx 但仍连不上且无 relay：对称型 NAT / CGNAT，
+                     * 必须配 TURN —— 这正是「同 WiFi 能打、换手机不行」的成因。
+                     */
+                    const c = e.candidate;
+                    const type = (c.type || (c.candidate || '').match(/\btyp\s+(\w+)/) || [])[1] || '?';
+                    this._iceStats = this._iceStats || {};
+                    this._iceStats[type] = (this._iceStats[type] || 0) + 1;
+                    if (type === 'relay') this._iceStats.hasRelay = true;
+
                     this.socket.emit(EV.signal, {
-                        signal: { candidate: e.candidate.toJSON ? e.candidate.toJSON() : e.candidate },
+                        signal: { candidate: c.toJSON ? c.toJSON() : c },
                         metadata: {},
                         sessionId: sid,
                         target: remoteId
                     });
+                } else if (!e.candidate) {
+                    // 收集结束：把汇总打出来，一眼能看出缺哪类候选
+                    const s = this._iceStats || {};
+                    console.log(
+                        `[rtc] ICE 收集完成 host=${s.host || 0} srflx=${s.srflx || 0} relay=${s.relay || 0}`,
+                        `（中继候选：${s.hasRelay ? '有' : '无'}）`
+                    );
+                    if (!s.srflx && !s.relay) {
+                        console.warn('[rtc] 未收集到公网候选，跨网络将无法建立连接（STUN 不可达？）');
+                    } else if (!s.hasRelay) {
+                        console.warn('[rtc] 未收集到中继候选 —— 对称型 NAT / 移动网络下会连不通，请检查 TURN 配置');
+                    }
                 }
+            };
+
+            /*
+             * ICE 候选收集失败（单个服务器不可达）。
+             *
+             * 这个事件**必须监听**：默认行为完全静默，STUN 被墙时
+             * 只会表现为「连不上」，没有任何线索可查。
+             */
+            peer.onicecandidateerror = e => {
+                console.warn(
+                    '[rtc] ICE 候选收集失败:',
+                    `url=${(e && e.url) || '?'}`,
+                    `code=${(e && e.errorCode) || '?'}`,
+                    (e && e.errorText) || ''
+                );
             };
 
             /*
@@ -1994,6 +2191,25 @@ export default {
                     console.warn('[rtc] 远端画面播放被拦:', (err && err.message) || err);
                 });
                 this.watchRemoteTracks(remoteId, stream);
+            };
+
+            /*
+             * ICE 连接状态。
+             *
+             * 与 connectionState 分开看：ICE 才是「网络是否打通」的直接指标。
+             * 它停在 checking 说明候选交换了但没有任何一对能通 ——
+             * 跨网络场景下这几乎总是「缺 TURN」。
+             */
+            peer.oniceconnectionstatechange = () => {
+                const s = peer.iceConnectionState;
+                if (s === 'checking') {
+                    console.log('[rtc] ICE 开始连通性检查');
+                } else if (s === 'connected' || s === 'completed') {
+                    console.log(`[rtc] ICE 已连通（${s}）`);
+                } else if (s === 'failed') {
+                    console.error('[rtc] ICE 连通失败 —— 候选无法互通，通常是对称型 NAT 且无 TURN 中继');
+                    this.emit('error', { message: '网络无法打通，请检查 TURN 服务是否可用' });
+                }
             };
 
             // 连接状态
@@ -2725,6 +2941,17 @@ export default {
              */
             this.mediaCancelled = true;
             this.mediaTask = null;
+
+            /*
+             * 复位 ICE 缓存与候选统计。
+             *
+             * 候选统计按连接累计，不清会让下一次通话的汇总数字虚高；
+             * ICE 缓存也一并清掉，使重进房间时重新拉取（凭据可能已轮换）。
+             */
+            this._iceStats = null;
+            this.iceServers = null;
+            this.iceFetchedAt = 0;
+            this.iceHasTurn = false;
 
             // 断开信令
             if (this.socket) {
